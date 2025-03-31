@@ -4,6 +4,9 @@ using Logging
 using Base: Expr
 using Printf
 using HerbGrammar
+using HerbSearch
+import HerbSearch
+import HerbSearch.combine
 # Step 1 : Get the response
 
 #run(`python test5.py`)
@@ -288,6 +291,10 @@ function canonical_rule_string(sym::Symbol)
     return replace(string(sym), r"\s+" => "")
 end
 
+function canonical_rule_string(x)
+    return replace(string(x), r"\s+" => "")
+end
+
 function make_pcsg_from_dict(grammar::ContextSensitiveGrammar, prob_dict::Dict{String, Dict{String, Float64}})
     rules = grammar.rules
     bytype_in = grammar.bytype
@@ -383,4 +390,191 @@ end
 print_pcsg_rules(pcsg)
 #println(pcsg)
 
+# TESTS
 
+using HerbCore
+using HerbSearch
+using HerbGrammar
+using HerbInterpret
+using HerbConstraints
+using HerbSpecification
+using Test
+using Aqua
+using Random
+import HerbSearch.init_combine_structure
+import HerbSearch.get_bank
+import HerbSearch.get_grammar
+import HerbSearch.combine
+
+
+
+@testset "Bottom Up Search" begin
+    grammars_to_test = Dict(
+        "arity <= 1" => (@csgrammar begin
+            Int = 1 | 2
+            Int = 3 + Int
+        end),
+        "arity = 2" => (@csgrammar begin
+            Int = 1 | 2
+            Int = Int + Int
+        end)
+    )
+
+    function test_with_grammars(f, grammars)
+        for (name, g) in grammars
+            @testset "$name" f(g)
+        end
+    end
+
+    @programiterator mutable MyBU(bank) <: BottomUpIterator
+
+    function HerbSearch.init_combine_structure(iter::MyBU)
+        Dict(:max_combination_depth => 10)
+    end
+    HerbSearch.get_bank(iter::MyBU) = iter.bank
+    HerbSearch.get_grammar(iter::MyBU) = iter.solver.grammar
+
+    @testset "basic" begin
+        g = grammars_to_test["arity = 2"]
+        iter = MyBU(g, :Int, nothing; max_depth=5)
+        expected_programs = [
+            (@rulenode 1),
+            (@rulenode 2),
+            (@rulenode 3{1,1}),
+            (@rulenode 3{2,1}),
+            (@rulenode 3{1,2}),
+            (@rulenode 3{2,2})
+        ]
+
+        progs = [freeze_state(p) for (i, p) in enumerate(iter) if i <= 6]
+        @test issetequal(progs, expected_programs)
+        @test length(expected_programs) == length(progs)
+    end
+
+    @testset "combine" begin
+        test_with_grammars(grammars_to_test) do g
+            iter = MyBU(g, :Int, nothing; max_depth=5)
+            create_bank!(iter)
+            populate_bank!(iter)
+
+            combinations, state = combine(iter, init_combine_structure(iter))
+            @test !isempty(combinations)
+        end
+    end
+
+    @testset "enumeration order" begin
+        g = @csgrammar begin
+            Int = 1
+            Int = 2
+            Int = Int + Int
+        end
+    
+        iter = MyBU(g, :Int, nothing; max_depth=5)
+    
+        # This will collect programs in order as they are returned
+        progs = [freeze_state(p) for (i, p) in enumerate(iter) if i <= 6]
+        println(progs)
+        expected_order = [
+            (@rulenode 1),                     # Int = 1
+            (@rulenode 2),                     # Int = 2
+            (@rulenode 3{1,1}),                # 1 + 1
+            (@rulenode 3{1,2}),                # 1 + 2
+            (@rulenode 3{2,1}),                # 2 + 1
+            (@rulenode 3{2,2})                 # 2 + 2
+        ]
+    
+        @test progs == expected_order  # 🔍 Order matters!
+    end
+end
+
+function combine(iter::BottomUpIterator, state)
+    addresses = Vector{CombineAddress}()
+    max_in_bank = maximum(keys(get_bank(iter)))
+    grammar = get_grammar(iter.solver)
+    terminals = grammar.isterminal
+    nonterminals = .~terminals
+    non_terminal_shapes = UniformHole.(partition(Hole(nonterminals), grammar), ([],))
+
+    if max_in_bank >= state[:max_combination_depth]
+        return nothing, nothing
+    end
+
+    function check_bound(combination)
+        return 1 + sum((x[1] for x in combination)) > max_in_bank
+    end
+
+    scored_combinations = []
+
+    for rule_idx in eachindex(grammar.rules)
+        rule = grammar.rules[rule_idx]
+        if grammar.isterminal[rule_idx]
+            continue
+        end
+    
+        shape = UniformHole(BitVector(i == rule_idx for i in 1:length(grammar.rules)), [])
+        nchildren = length(grammar.childtypes[rule_idx])
+    
+        all_addresses = ((key, idx) for key in keys(get_bank(iter)) for idx in eachindex(get_bank(iter)[key]))
+        all_combinations = Iterators.product(Iterators.repeated(all_addresses, nchildren)...)
+        filtered_combinations = Iterators.filter(check_bound, all_combinations)
+    
+        for address_pair in filtered_combinations
+            combine_addr = CombineAddress(shape, AccessAddress.(address_pair))
+            score = grammar.log_probabilities[rule_idx]
+    
+            @info "Scoring combination" rule=rule score=score
+    
+            push!(scored_combinations, (score, combine_addr))
+        end
+    end
+
+    sorted = sort(scored_combinations; by = x -> -x[1])
+    addresses = last.(sorted) 
+    return addresses, state
+end
+
+@testset "pcfg prioritization in combine" begin
+    # Declare rules in order that mismatches their probabilities
+    g = @csgrammar begin
+        Int = Int + Int   # Rule 1
+        Int = Int - Int   # Rule 2
+        Int = Int * Int   # Rule 3
+        Int = 1
+        Int = 2
+    end
+
+    # Flip the priority compared to rule declaration order
+    rule_counts = Dict(
+        "Int->Int+Int" => 10,   # Should be second
+        "Int->Int-Int" => 1,    # Should be last
+        "Int->Int*Int" => 100,  # Should be chosen FIRST
+        "Int->1" => 1,
+        "Int->2" => 1
+    )
+
+    pcfg = make_pcsg_from_dict(g, construct_dict(rule_counts))
+    iter = MyBU(pcfg, :Int, nothing; max_depth=3)
+
+    create_bank!(iter)
+    populate_bank!(iter)
+    combinations, _ = combine(iter, init_combine_structure(iter))
+
+    @test !isempty(combinations)
+
+    top_n = min(5, length(combinations))
+    rule_indices = [findfirst(ca.op.domain) for ca in combinations[1:top_n]]
+    grammar = get_grammar(iter)
+    rule_names = [sprint(show, grammar.rules[i]) for i in rule_indices]
+
+    @info "Top rule names (should reflect PCFG priority)" rule_names=rule_names
+
+    idx_mul = findfirst(contains("Int * Int"), rule_names)
+    idx_plus = findfirst(contains("Int + Int"), rule_names)
+    idx_minus = findfirst(contains("Int - Int"), rule_names)
+
+    @test idx_mul !== nothing
+    @test idx_plus !== nothing
+    @test idx_minus !== nothing
+
+    @test idx_mul < idx_plus < idx_minus  # 'Int * Int' should appear first!
+end
