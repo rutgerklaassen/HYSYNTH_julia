@@ -60,7 +60,6 @@ function parse_condition(token::AbstractString)
     return nothing  # Not a valid condition
 end
 
-############ TESTING ############
 # Finds the correct closing parenthesis for IF(...) or WHILE(...)
 function find_matching_paren(tokens::Vector{<:AbstractString}, start_index::Int)
     count = 0
@@ -356,17 +355,6 @@ grammar_robots = @csgrammar begin
                 notAtTop() | notAtBottom() | notAtLeft() | notAtRight()
 end
 
-# prob_dict = Dict(
-#     "Start" => Dict("Sequence" => 1.0),
-#     "Sequence" => Dict("Operation" => 0.25, "(Operation;Sequence)" => 0.75),
-#     "Operation" => Dict("Transformation" => 0.5, "ControlStatement" => 0.5),
-#     "Transformation" => Dict(
-#         "moveRight()" => 0.25,
-#         "moveDown()" => 0.25,
-#         "grab()" => 0.25,
-#         "drop()" => 0.25
-#     )
-# )
 
 pcsg = make_pcsg_from_dict(grammar_robots, construct_dict(rule_counts_1))
 
@@ -402,8 +390,6 @@ using Test
 using Aqua
 using Random
 import HerbSearch.init_combine_structure
-import HerbSearch.get_bank
-import HerbSearch.get_grammar
 import HerbSearch.combine
 
 
@@ -431,8 +417,7 @@ import HerbSearch.combine
     function HerbSearch.init_combine_structure(iter::MyBU)
         Dict(:max_combination_depth => 10)
     end
-    HerbSearch.get_bank(iter::MyBU) = iter.bank
-    HerbSearch.get_grammar(iter::MyBU) = iter.solver.grammar
+    
 
     @testset "basic" begin
         g = grammars_to_test["arity = 2"]
@@ -563,7 +548,7 @@ end
 
     top_n = min(5, length(combinations))
     rule_indices = [findfirst(ca.op.domain) for ca in combinations[1:top_n]]
-    grammar = get_grammar(iter)
+    grammar = get_grammar(iter.solver)
     rule_names = [sprint(show, grammar.rules[i]) for i in rule_indices]
 
     @info "Top rule names (should reflect PCFG priority)" rule_names=rule_names

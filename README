@@ -1,0 +1,6 @@
+Github repo for implementing HYSYNTH in Julia
+
+The robot_HYSYNTH.jl file is the original file where I programmed everything in
+
+the /src directory is the refactored version of thr robot_HYSYNTH.jl file, but has not gone through extensive testing (but I think it works). 
+As that's way more organized, it would be easiest to start there.
