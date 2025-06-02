@@ -18,13 +18,7 @@ end
 response = read("response.txt", String)
 println(response)
 
-# Okay now that we have the response let's do something with it? 
 
-# Step 2 : Learning PCFG from solution  
-
-# Okay we have a solution here, how do we get to a pcfg? 
-
-# Step 2.1 : Extract Rule sequence 
 
 # Define a parse tree structure
 # It works like any other tree, where a node contains the rule used and defines the children

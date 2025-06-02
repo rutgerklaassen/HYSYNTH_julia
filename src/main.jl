@@ -45,8 +45,7 @@ for tree in parsed_trees
         dict = construct_dict(rule_counts)
         println(dict)
         pcsg = make_pcsg_from_dict(grammar_robots, dict)
-        println(pcsg)
-
+        
         #print_pcsg_rules(pcsg)
 
         #run_synthesis_tests(pcsg)
