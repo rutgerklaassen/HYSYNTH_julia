@@ -48,15 +48,16 @@ function make_pcsg_from_dict(grammar::ContextSensitiveGrammar, prob_dict::Dict{S
     bytype_in = grammar.bytype
 
     selected_rules = Expr[]
-    log_probs = Float64[]
+    log_probs = fill(-Inf, length(grammar.rules)) 
     bytype_out = Dict{Symbol, Vector{Int}}()
-
     for (lhs, rule_indices) in bytype_in
-        lhs_str = string(lhs)
-        dict_for_lhs = get(prob_dict, lhs_str, Dict{String, Float64}())
+        lhs_str = string(lhs) # Turn into string so we can match on it
 
-        rule_exprs = [rules[i] for i in rule_indices]
+        dict_for_lhs = get(prob_dict, lhs_str, Dict{String, Float64}())
+        rule_exprs = [rules[i] for i in rule_indices] # Gets all possible RHS 
         rule_keys = [canonical_rule_string(expr) for expr in rule_exprs]
+
+
         counts = [get(dict_for_lhs, key, 0.0) for key in rule_keys]
         weights = [count + 1.0 for count in counts]  # alpha = 1.0
         total = sum(counts) + 1.0 * length(rule_keys)
@@ -64,23 +65,20 @@ function make_pcsg_from_dict(grammar::ContextSensitiveGrammar, prob_dict::Dict{S
        # @show lhs rule_keys counts
 
         for (expr, prob) in zip(rule_exprs, probs)
-            expr = expr isa Expr ? expr : Expr(:call, expr)
-            push!(selected_rules, expr)
-            push!(log_probs, log(prob))
-
-            if !haskey(bytype_out, lhs)
-                bytype_out[lhs] = Int[]
+            for (j, rule) in enumerate(grammar.rules)
+                if expr == rule
+                    log_probs[j] = log(prob)
+                    break
+                end
             end
-            push!(bytype_out[lhs], length(selected_rules))
         end
     end
-
     return ContextSensitiveGrammar(
-        selected_rules,
+        grammar.rules,
         grammar.types,
         grammar.isterminal,
         grammar.iseval,
-        bytype_out,
+        grammar.bytype,
         grammar.domains,
         grammar.childtypes,
         grammar.bychildtypes,
