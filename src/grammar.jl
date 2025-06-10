@@ -45,29 +45,26 @@ end
 
 function make_pcsg_from_dict(grammar::ContextSensitiveGrammar, prob_dict::Dict{String, Dict{String, Float64}})
     rules = grammar.rules
-    bytype_in = grammar.bytype
-
-    selected_rules = Expr[]
-    log_probs = fill(-Inf, length(grammar.rules)) 
-    bytype_out = Dict{Symbol, Vector{Int}}()
+    bytype_in = grammar.bytype   
+    log_probs = fill(Inf, length(grammar.rules))  # Start with high cost (not -Inf)
+    alpha = 1.0  # Laplace smoothing parameter
+    println(prob_dict)
     for (lhs, rule_indices) in bytype_in
-        lhs_str = string(lhs) # Turn into string so we can match on it
-
+        lhs_str = string(lhs)
         dict_for_lhs = get(prob_dict, lhs_str, Dict{String, Float64}())
-        rule_exprs = [rules[i] for i in rule_indices] # Gets all possible RHS 
+
+        rule_exprs = [rules[i] for i in rule_indices]
         rule_keys = [canonical_rule_string(expr) for expr in rule_exprs]
 
-
         counts = [get(dict_for_lhs, key, 0.0) for key in rule_keys]
-        weights = [count + 1.0 for count in counts]  # alpha = 1.0
-        total = sum(counts) + 1.0 * length(rule_keys)
+        weights = [count + alpha for count in counts]
+        total = sum(weights)
         probs = weights ./ total
-       # @show lhs rule_keys counts
-
         for (expr, prob) in zip(rule_exprs, probs)
-            for (j, rule) in enumerate(grammar.rules)
+            cost = -log2(prob)
+            for (j, rule) in enumerate(rules)
                 if expr == rule
-                    log_probs[j] = log(prob)
+                    log_probs[j] = cost
                     break
                 end
             end
@@ -86,6 +83,7 @@ function make_pcsg_from_dict(grammar::ContextSensitiveGrammar, prob_dict::Dict{S
         grammar.constraints
     )
 end
+
 
 grammar_robots = @csgrammar begin
     Start = Sequence
@@ -107,7 +105,7 @@ function print_pcsg_rules(grammar::ContextSensitiveGrammar)
         println("  [$lhs]")
         for i in rule_indices
             rule = grammar.rules[i]
-            prob = exp(grammar.log_probabilities[i])
+            prob = grammar.log_probabilities[i]
 
             @printf("    %.3f : %s = %s\n", prob, lhs, sprint(show, rule))
         end

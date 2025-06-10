@@ -41,16 +41,19 @@ end
 for tree in parsed_trees
     if tree !== nothing
         rule_counts = print_tree(tree)
-        println(rule_counts)
+        #println(rule_counts)
         dict = construct_dict(rule_counts)
-        println(dict)
+        #println(dict)
         pcsg = make_pcsg_from_dict(grammar_robots, dict)
         
         #print_pcsg_rules(pcsg)
 
         #run_synthesis_tests(pcsg)
-        println(grammar_robots)
-        run_synthesis(pcsg)
+        #println(grammar_robots)
+        #run_synthesis(pcsg)
+
+        run_priority_robot_test()
+        exit()
     else
         println("Failed to parse LLM response.")
     end
