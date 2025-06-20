@@ -29,18 +29,19 @@ grammar_robots = @csgrammar begin
     Sequence = Operation
     Sequence = (Operation; Sequence)
     Operation = Transformation
-    Operation = ControlStatement
-    Transformation = moveRight() | moveDown() | moveLeft() | moveUp() | drop() | grab()
-    ControlStatement = IF(Condition, Sequence, Sequence)
-    ControlStatement = WHILE(Condition, Sequence)
-    Condition = atTop() | atBottom() | atLeft() | atRight() |
-                notAtTop() | notAtBottom() | notAtLeft() | notAtRight()
+    #Operation = ControlStatement
+    Transformation = moveRight() #| moveDown() | moveLeft() | moveUp() | drop() | grab()
+    #ControlStatement = IF(Condition, Sequence, Sequence)
+    #ControlStatement = WHILE(Condition, Sequence)
+    #Condition = atTop() | atBottom() | atLeft() | atRight() |
+                #notAtTop() | notAtBottom() | notAtLeft() | notAtRight()
 end
+
 
 # Loop through each parsed tree
 for tree in parsed_trees
     if tree !== nothing
-        rule_counts = print_tree(tree)
+        rule_counts = Utils.print_tree(tree)
         #println(rule_counts)
         dict = construct_dict(rule_counts)
         #println(dict)

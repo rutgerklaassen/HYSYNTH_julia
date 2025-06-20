@@ -90,12 +90,12 @@ grammar_robots = @csgrammar begin
     Sequence = Operation
     Sequence = (Operation; Sequence)
     Operation = Transformation
-    Operation = ControlStatement
-    Transformation = moveRight() | moveDown() | moveLeft() | moveUp() | drop() | grab()
-    ControlStatement = IF(Condition, Sequence, Sequence)
-    ControlStatement = WHILE(Condition, Sequence)
-    Condition = atTop() | atBottom() | atLeft() | atRight() |
-                notAtTop() | notAtBottom() | notAtLeft() | notAtRight()
+    #Operation = ControlStatement
+    Transformation = moveRight() #| moveDown() | moveLeft() | moveUp() | drop() | grab()
+    #ControlStatement = IF(Condition, Sequence, Sequence)
+    #ControlStatement = WHILE(Condition, Sequence)
+    #Condition = atTop() | atBottom() | atLeft() | atRight() |
+                #notAtTop() | notAtBottom() | notAtLeft() | notAtRight()
 end
 
 

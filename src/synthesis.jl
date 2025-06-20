@@ -8,124 +8,119 @@ import ..Grammar
 import HerbSearch: get_bank
 
 
-@programiterator mutable MyBU(bank) <: BottomUpIterator
+@programiterator MyBU(bank=DefaultDict{Int,DefaultDict}(() -> (DefaultDict{Symbol,AbstractVector{AbstractRuleNode}}(() -> AbstractRuleNode[]))),
+    max_cost_in_bank=25,
+    current_max_cost = 1
+) <: BottomUpIterator
 
 function HerbSearch.init_combine_structure(iter::MyBU)
-    Dict(:max_cost_in_bank => 20)
+    return Dict(
+        :max_cost_in_bank => iter.max_cost_in_bank,
+        :current_max_cost => iter.current_max_cost
+    )
 end
 
 const COST_PRECISION = 1e-6
-round_cost(x::Real) = round(x; digits=4)  # enforce consistent dictionary keys
+round_cost(x::Real) = trunc(Int,ceil(x))  # enforce consistent dictionary keys
 
-function HerbSearch.create_bank!(iter::MyBU)
-    iter.bank = DefaultDict{Float64, Vector{AbstractRuleNode}}(() -> AbstractRuleNode[])
-end
 
 function HerbSearch.populate_bank!(iter::BottomUpIterator)::AbstractVector{AccessAddress}
     grammar = HerbSearch.get_grammar(iter.solver)
-    # Create the terminal programs
-    terminal_programs = UniformHole(grammar.isterminal, [])
-
-    # Initialize bank entries for each terminal according to its log_prob
-    for (i, is_terminal) in enumerate(grammar.isterminal)
+    for (i, is_terminal) in enumerate(grammar.isterminal) #loop over all terminals
         if is_terminal
-            logprob = grammar.log_probabilities[i]
-            println(logprob)
-            index = round_cost(logprob)  # safe index
-    
-            # Create BitVector with single true
+            logprob = grammar.log_probabilities[i] # get log prob per termminal
+            index = round_cost(logprob) # Make it the index
+            program_type = grammar.types[i] # Make sure to sort by type
+
             bv = falses(length(grammar.isterminal))
-            bv[i] = true
-            program = UniformHole(bv, [])  # This is the correct UniformHole
-    
-            if !(haskey(get_bank(iter), index))
-                get_bank(iter)[index] = Vector{AbstractRuleNode}()
-            end
-    
-            push!(get_bank(iter)[index], program)
+            bv[i] = true # Create bitvector with "true"for the correct terminal rule used
+            program = UniformHole(bv, []) # Make a program from it
+
+            push!(get_bank(iter)[index][program_type], program) # Push to bank by it's log_prob and type
         end
     end
-    
 
-    # Add all terminals to the solver state
-    new_state!(iter.solver, terminal_programs)
-
-    # Return AccessAddress for all terminals in the bank (flattened)
-    return [AccessAddress((idx, x)) for (idx, bucket) in get_bank(iter) for x in 1:length(bucket)]
+    return [AccessAddress((index, t, x))
+            for (index, bucket) in get_bank(iter)
+            for (t, vec) in bucket
+            for x in 1:length(vec)]
 end
 
 
-function HerbSearch.new_address(iter::MyBU, program_combination::AbstractAddress)::AbstractAddress
-    # println("type of program_combination: ", typeof(program_combination))
-    # println("type of iter: ", typeof(iter))
-    # println(program_combination.op.domain)
+function HerbSearch.new_address(iter::MyBU, program_combination::CombineAddress, program_type::Symbol, idx)::AbstractAddress
     grammar = HerbSearch.get_grammar(iter.solver)
     rule_cost = grammar.log_probabilities[findfirst(program_combination.op.domain)]
     child_costs = sum(x.addr[1] for x in program_combination.addrs)
     total_cost = round_cost(rule_cost + child_costs)
-    return AccessAddress((total_cost, 1))  # The second element can be 1 if you don’t care about indexing
+
+    return AccessAddress((total_cost, program_type, idx))
 end
 
-function HerbSearch.add_to_bank!(iter::MyBU, program::AbstractRuleNode, address::AccessAddress)::Bool
-    cost = round_cost(address.addr[1])
-    push!(get_bank(iter)[cost], program)
-    return true  # You can insert observational equivalence checks later
+function HerbSearch.add_to_bank!(iter::MyBU, program_combination::AbstractAddress, program::AbstractRuleNode, program_type::Symbol)::Bool
+    bank = get_bank(iter)
+    prog_cost = 1 + maximum([x.addr[1] for x in program_combination.addrs])
+    n_in_bank = length(bank[prog_cost][program_type])
+    address = new_address(iter, program_combination, program_type, n_in_bank + 1)
+
+    push!(get_bank(iter)[address.addr[1]][address.addr[2]], program)
+
+    return true
 end
 
 function HerbSearch.combine(iter::MyBU, state)
-    addresses = Vector{CombineAddress}()
     bank = get_bank(iter)
     max_cost_in_bank = isempty(bank) ? 0.0 : maximum(keys(bank))
+    max_total_cost = state[:max_cost_in_bank]
+    current_limit = state[:current_max_cost]
+
     grammar = HerbSearch.get_grammar(iter.solver)
     terminals = grammar.isterminal
     nonterminals = .~terminals
     non_terminal_shapes = UniformHole.(partition(Hole(nonterminals), grammar), ([],))
 
-    # if we have exceeded the maximum number of programs to generate
-    if max_cost_in_bank >= state[:max_cost_in_bank]
+    if max_cost_in_bank >= max_total_cost
         return nothing, nothing
     end
 
-    #check bound function TODO: This definetly needs fixing but not right now
-    # function check_bound(combination)
-    #     return sum((x[1] for x in combination)) > max_cost_in_bank
-    # end
+    # One-pass tuple collection with precomputed cost
+    scored_combinations = Tuple{CombineAddress, Int}[]
 
-    function estimate_cost(grammar, addr::CombineAddress)
-        child_costs = sum(x.addr[1] for x in addr.addrs)
-        rule_cost = grammar.log_probabilities[findfirst(addr.op.domain)]
-        return round_cost(child_costs + rule_cost)
-    end
-
-    all_combinations = CombineAddress[]
     for shape in non_terminal_shapes
         nchildren = length(grammar.childtypes[findfirst(shape.domain)])
 
-        # Create address pairs for child programs in bank
-        all_addresses = ((key, idx) for key in keys(bank) for idx in eachindex(bank[key]))
+        all_addresses = (
+            (key, typename, idx)
+            for key in keys(bank) if key <= current_limit
+            for typename in keys(bank[key])
+            for idx in eachindex(bank[key][typename])
+        )
+
         combinations = Iterators.product(Iterators.repeated(all_addresses, nchildren)...)
 
-        # Wrap into CombineAddress structs
         combine_addrs = map(address_pair -> CombineAddress(shape, AccessAddress.(address_pair)), combinations)
 
-        # Filter based on cost
         for addr in combine_addrs
-            if estimate_cost(grammar, addr) <= state[:max_cost_in_bank]
-                push!(all_combinations, addr)
+            child_costs = sum(x.addr[1] for x in addr.addrs)
+            rule_cost = grammar.log_probabilities[findfirst(addr.op.domain)]
+            total_cost = round_cost(child_costs + rule_cost)
+
+            if total_cost <= current_limit && total_cost <= max_total_cost
+                #println(addr)
+                push!(scored_combinations, (addr, total_cost))
             end
         end
     end
 
-    # Global sort across all rule shapes
-    sorted_combinations = sort(all_combinations; by = addr -> estimate_cost(grammar, addr))
-    # println("\n📦 Top 100 CombineAddresses by estimated cost:")
-    # for (i, addr) in enumerate(sorted_combinations[1:min(100, end)])
-    #     est_cost = estimate_cost(grammar, addr)
-    #     println("[$i] Cost = $est_cost │ Shape = $(addr.op.domain) │ Child costs = $([x.addr[1] for x in addr.addrs])")
-    # end    
-    return sorted_combinations, state
-end
+    # Sort based on precomputed total_cost
+    sorted_combinations = sort(scored_combinations; by = x -> x[2], rev=true)
+    final = first.(sorted_combinations)  # Extract only CombineAddress objects
 
+    println("Combinations for cost level $current_limit: ", length(final))
+    # println(final)
+    state[:current_max_cost] += 1
+
+    return final, state
+end
 
 function run_synthesis_tests(grammar)
     # @testset "Bottom Up Search" begin
@@ -246,13 +241,12 @@ function run_synthesis(grammar)
     for (i, pair) in enumerate(pairs)
         if(i < 2)
             println("Running problem number $i.")
-            iterator = MyBU(grammar, :Start, nothing; max_depth=10)
+            iterator = MyBU(grammar, :Start, max_cost_in_bank=25)
             solution = my_synth(pair.problem, iterator)
 
             if !isnothing(solution)
                 @show "Solution: ", solution
                 solved_problemos += 1
-                #exit()
             end
         end
     end
@@ -269,23 +263,23 @@ function run_priority_robot_test()
         "Sequence->Operation",
         "Sequence->(Operation;Sequence)",
         "Operation->Transformation",
-        "Operation->ControlStatement",
+        # "Operation->ControlStatement",
         "Transformation->moveRight()",
-        "Transformation->moveDown()",
-        "Transformation->moveLeft()",
-        "Transformation->moveUp()",
-        "Transformation->drop()",
-        "Transformation->grab()",
-        "ControlStatement->IF(Condition,Sequence,Sequence)",
-        "ControlStatement->WHILE(Condition,Sequence)",
-        "Condition->atTop()",
-        "Condition->atBottom()",
-        "Condition->atLeft()",
-        "Condition->atRight()",
-        "Condition->notAtTop()",
-        "Condition->notAtBottom()",
-        "Condition->notAtLeft()",
-        "Condition->notAtRight()"
+        # "Transformation->moveDown()",
+        # "Transformation->moveLeft()",
+        # "Transformation->moveUp()",
+        # "Transformation->drop()",
+        # "Transformation->grab()",
+        # "ControlStatement->IF(Condition,Sequence,Sequence)",
+        # "ControlStatement->WHILE(Condition,Sequence)",
+        # "Condition->atTop()",
+        # "Condition->atBottom()",
+        # "Condition->atLeft()",
+        # "Condition->atRight()",
+        # "Condition->notAtTop()",
+        # "Condition->notAtBottom()",
+        # "Condition->notAtLeft()",
+        # "Condition->notAtRight()"
     ]
     
     # GOOD: reward common low-level movements and correct structure
@@ -296,7 +290,7 @@ function run_priority_robot_test()
     ) for rule in all_rules)
     # BAD: reward loops and irrelevant conditions
     bad_counts = Dict(rule => (
-        occursin("moveLeft", rule) || occursin("WHILE", rule) || occursin("IF", rule) || occursin("notAtTop", rule) || occursin("notAtLeft", rule) ? 100 :
+        occursin("moveRight", rule) || occursin("WHILE", rule) || occursin("IF", rule) || occursin("notAtTop", rule) || occursin("notAtLeft", rule) ? 100 :
         occursin("Sequence", rule) || occursin("Operation", rule) ? 20 :
         1
     ) for rule in all_rules)
