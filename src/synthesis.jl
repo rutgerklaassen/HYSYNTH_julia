@@ -9,8 +9,9 @@ import HerbSearch: get_bank
 
 
 @programiterator MyBU(bank=DefaultDict{Int,DefaultDict}(() -> (DefaultDict{Symbol,AbstractVector{AbstractRuleNode}}(() -> AbstractRuleNode[]))),
-    max_cost_in_bank=25,
-    current_max_cost = 1
+    max_cost_in_bank=0,
+    current_max_cost = 2,
+    seen_programs = Set{UniformHole}()  #  field to track structurally unique programs
 ) <: BottomUpIterator
 
 function HerbSearch.init_combine_structure(iter::MyBU)
@@ -67,7 +68,11 @@ function HerbSearch.add_to_bank!(iter::MyBU, program_combination::AbstractAddres
     return true
 end
 
+
+
 function HerbSearch.combine(iter::MyBU, state)
+    # @show state.starting_node
+    # @show get_type(get_grammar(solver), state.starting_node)
     bank = get_bank(iter)
     max_cost_in_bank = isempty(bank) ? 0.0 : maximum(keys(bank))
     max_total_cost = state[:max_cost_in_bank]
@@ -77,11 +82,31 @@ function HerbSearch.combine(iter::MyBU, state)
     terminals = grammar.isterminal
     nonterminals = .~terminals
     non_terminal_shapes = UniformHole.(partition(Hole(nonterminals), grammar), ([],))
-
-    if max_cost_in_bank >= max_total_cost
+    println(current_limit)
+    println(max_total_cost)
+    if current_limit > max_total_cost
         return nothing, nothing
     end
 
+    function appropriately_typed(child_types)
+        return combination -> child_types == [x[2] for x in combination]
+    end
+
+    function reconstruct_program(iter::BottomUpIterator, addr::CombineAddress)::UniformHole
+        children = [retrieve(iter, a) for a in addr.addrs]
+        return UniformHole(addr.op.domain, children)
+    end
+
+    function check_seen_programs(iter::BottomUpIterator, addr::CombineAddress)
+        for program in iter.seen_programs
+            # println("Comparing :", program, " with : ", addr)
+            if HerbConstraints.pattern_match(program, reconstruct_program(iter, addr)) == HerbConstraints.PatternMatchSuccess()
+                # println("FOUND ONE!")
+                return true
+            end
+        end
+        return false
+    end
     # One-pass tuple collection with precomputed cost
     scored_combinations = Tuple{CombineAddress, Int}[]
 
@@ -96,17 +121,27 @@ function HerbSearch.combine(iter::MyBU, state)
         )
 
         combinations = Iterators.product(Iterators.repeated(all_addresses, nchildren)...)
-
-        combine_addrs = map(address_pair -> CombineAddress(shape, AccessAddress.(address_pair)), combinations)
+        bounded_and_typed_combinations = Iterators.filter(appropriately_typed(grammar.childtypes[findfirst(shape.domain)]), combinations)
+        combine_addrs = map(address_pair -> CombineAddress(shape, AccessAddress.(address_pair)), bounded_and_typed_combinations)
 
         for addr in combine_addrs
+
             child_costs = sum(x.addr[1] for x in addr.addrs)
             rule_cost = grammar.log_probabilities[findfirst(addr.op.domain)]
             total_cost = round_cost(child_costs + rule_cost)
 
             if total_cost <= current_limit && total_cost <= max_total_cost
-                #println(addr)
-                push!(scored_combinations, (addr, total_cost))
+                prog = reconstruct_program(iter, addr)
+
+                if check_seen_programs(iter, addr)
+                    continue
+                else
+                    # println("ADDED")
+                    push!(iter.seen_programs, prog)
+                    check_seen_programs(iter, addr)
+                    # println(iter.seen_programs)
+                    push!(scored_combinations, (addr, total_cost))
+                end
             end
         end
     end
@@ -115,10 +150,12 @@ function HerbSearch.combine(iter::MyBU, state)
     sorted_combinations = sort(scored_combinations; by = x -> x[2], rev=true)
     final = first.(sorted_combinations)  # Extract only CombineAddress objects
 
-    println("Combinations for cost level $current_limit: ", length(final))
-    # println(final)
+    if isempty(final)
+        state[:current_max_cost] += 1
+        return combine(iter, state)
+    end
+    
     state[:current_max_cost] += 1
-
     return final, state
 end
 
@@ -241,7 +278,7 @@ function run_synthesis(grammar)
     for (i, pair) in enumerate(pairs)
         if(i < 2)
             println("Running problem number $i.")
-            iterator = MyBU(grammar, :Start, max_cost_in_bank=25)
+            iterator = MyBU(grammar, :Start, max_cost_in_bank=15)
             solution = my_synth(pair.problem, iterator)
 
             if !isnothing(solution)
@@ -252,34 +289,35 @@ function run_synthesis(grammar)
     end
 end # End run synthesis function
 
-function run_priority_robot_test()
+function run_priority_robot_test(pcsg)
     pairs = get_all_problem_grammar_pairs(Robots_2020)
     pair = pairs[1]  # Pick the first task
-    base_grammar = pair.grammar
 
+    println(typeof(base_grammar))
+    exit()
     # RULE STRINGS — you can adjust this if needed
     all_rules = [
         "Start->Sequence",
         "Sequence->Operation",
         "Sequence->(Operation;Sequence)",
         "Operation->Transformation",
-        # "Operation->ControlStatement",
+        "Operation->ControlStatement",
         "Transformation->moveRight()",
-        # "Transformation->moveDown()",
-        # "Transformation->moveLeft()",
-        # "Transformation->moveUp()",
-        # "Transformation->drop()",
-        # "Transformation->grab()",
-        # "ControlStatement->IF(Condition,Sequence,Sequence)",
-        # "ControlStatement->WHILE(Condition,Sequence)",
-        # "Condition->atTop()",
-        # "Condition->atBottom()",
-        # "Condition->atLeft()",
-        # "Condition->atRight()",
-        # "Condition->notAtTop()",
-        # "Condition->notAtBottom()",
-        # "Condition->notAtLeft()",
-        # "Condition->notAtRight()"
+         "Transformation->moveDown()",
+        "Transformation->moveLeft()",
+        "Transformation->moveUp()",
+        "Transformation->drop()",
+        "Transformation->grab()",
+        "ControlStatement->IF(Condition,Sequence,Sequence)",
+        "ControlStatement->WHILE(Condition,Sequence)",
+        "Condition->atTop()",
+        "Condition->atBottom()",
+        "Condition->atLeft()",
+        "Condition->atRight()",
+        "Condition->notAtTop()",
+        "Condition->notAtBottom()",
+        "Condition->notAtLeft()",
+        "Condition->notAtRight()"
     ]
     
     # GOOD: reward common low-level movements and correct structure
@@ -303,6 +341,7 @@ function run_priority_robot_test()
     println("\n🔴 Running with BAD guidance...\n")
     bad_pcfg = Grammar.make_pcsg_from_dict(base_grammar, Grammar.construct_dict(bad_counts))
     println(bad_pcfg.log_probabilities)
+
     run_synthesis(bad_pcfg)
     #@show bad_pcfg.rules
     #@show bad_pcfg.log_probabilities

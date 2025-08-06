@@ -61,7 +61,7 @@ function make_pcsg_from_dict(grammar::ContextSensitiveGrammar, prob_dict::Dict{S
         total = sum(weights)
         probs = weights ./ total
         for (expr, prob) in zip(rule_exprs, probs)
-            cost = -log2(prob)
+            cost = max(-log2(prob), 1e-3)  # or 0.01, or some other small value
             for (j, rule) in enumerate(rules)
                 if expr == rule
                     log_probs[j] = cost
