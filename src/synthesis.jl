@@ -4,6 +4,8 @@ export run_synthesis_tests, run_synthesis, run_priority_robot_test
 using HerbGrammar, HerbSearch, HerbCore, HerbConstraints, HerbSpecification, HerbBenchmarks, Test
 using DataStructures: DefaultDict
 using Printf
+using HerbBenchmarks.Karel_2018
+
 import ..Grammar
 import HerbSearch: get_bank
 
@@ -57,9 +59,24 @@ function HerbSearch.new_address(iter::MyBU, program_combination::CombineAddress,
     return AccessAddress((total_cost, program_type, idx))
 end
 
+# function HerbSearch.add_to_bank!(iter::MyBU, program_combination::AbstractAddress, program::AbstractRuleNode, program_type::Symbol)::Bool
+#     bank = get_bank(iter)
+#     prog_cost = 1 + maximum([x.addr[1] for x in program_combination.addrs])
+#     n_in_bank = length(bank[prog_cost][program_type])
+#     address = new_address(iter, program_combination, program_type, n_in_bank + 1)
+
+#     push!(get_bank(iter)[address.addr[1]][address.addr[2]], program)
+
+#     return true
+# end
+
 function HerbSearch.add_to_bank!(iter::MyBU, program_combination::AbstractAddress, program::AbstractRuleNode, program_type::Symbol)::Bool
+    grammar = HerbSearch.get_grammar(iter.solver)
     bank = get_bank(iter)
-    prog_cost = 1 + maximum([x.addr[1] for x in program_combination.addrs])
+    rule_idx = findfirst(program_combination.op.domain) 
+    rule_cost = grammar.log_probabilities[rule_idx]
+
+    prog_cost = round_cost(rule_cost + sum(x.addr[1] for x in program_combination.addrs))
     n_in_bank = length(bank[prog_cost][program_type])
     address = new_address(iter, program_combination, program_type, n_in_bank + 1)
 
@@ -67,7 +84,6 @@ function HerbSearch.add_to_bank!(iter::MyBU, program_combination::AbstractAddres
 
     return true
 end
-
 
 
 function HerbSearch.combine(iter::MyBU, state)
@@ -81,9 +97,12 @@ function HerbSearch.combine(iter::MyBU, state)
     grammar = HerbSearch.get_grammar(iter.solver)
     terminals = grammar.isterminal
     nonterminals = .~terminals
-    non_terminal_shapes = UniformHole.(partition(Hole(nonterminals), grammar), ([],))
+    non_terminal_shapes = [let v = falses(length(dom)); v[j] = true; UniformHole(v, []) end
+                        for dom in partition(Hole(nonterminals), grammar)
+                        for j in findall(dom)] 
     println(current_limit)
     println(max_total_cost)
+
     if current_limit > max_total_cost
         return nothing, nothing
     end
@@ -94,14 +113,12 @@ function HerbSearch.combine(iter::MyBU, state)
 
     function reconstruct_program(iter::BottomUpIterator, addr::CombineAddress)::UniformHole
         children = [retrieve(iter, a) for a in addr.addrs]
-        return UniformHole(addr.op.domain, children)
+        return UniformHole(copy(addr.op.domain), children)
     end
 
     function check_seen_programs(iter::BottomUpIterator, addr::CombineAddress)
         for program in iter.seen_programs
-            # println("Comparing :", program, " with : ", addr)
             if HerbConstraints.pattern_match(program, reconstruct_program(iter, addr)) == HerbConstraints.PatternMatchSuccess()
-                # println("FOUND ONE!")
                 return true
             end
         end
@@ -119,26 +136,23 @@ function HerbSearch.combine(iter::MyBU, state)
             for typename in keys(bank[key])
             for idx in eachindex(bank[key][typename])
         )
-
         combinations = Iterators.product(Iterators.repeated(all_addresses, nchildren)...)
         bounded_and_typed_combinations = Iterators.filter(appropriately_typed(grammar.childtypes[findfirst(shape.domain)]), combinations)
         combine_addrs = map(address_pair -> CombineAddress(shape, AccessAddress.(address_pair)), bounded_and_typed_combinations)
 
         for addr in combine_addrs
-
+            
             child_costs = sum(x.addr[1] for x in addr.addrs)
             rule_cost = grammar.log_probabilities[findfirst(addr.op.domain)]
             total_cost = round_cost(child_costs + rule_cost)
 
             if total_cost <= current_limit && total_cost <= max_total_cost
                 prog = reconstruct_program(iter, addr)
-
                 if check_seen_programs(iter, addr)
                     continue
-                else
-                    # println("ADDED")
-                    push!(iter.seen_programs, prog)
-                    check_seen_programs(iter, addr)
+                else               
+                    push!(iter.seen_programs, deepcopy(prog))
+                    # check_seen_programs(iter, addr)
                     # println(iter.seen_programs)
                     push!(scored_combinations, (addr, total_cost))
                 end
@@ -251,17 +265,20 @@ function my_synth(problem::Problem, iterator::ProgramIterator)
         println("[$i] Trying program: $expr")
         falsified = false
         for ex in problem.spec
-            try
-                output = Robots_2020.interpret(program, HerbSearch.get_grammar(iterator.solver), ex)
+            println("EX: ",ex)
+            output = Robots_2020.interpret(program, HerbSearch.get_grammar(iterator.solver), ex)
+            println("OUTPUT: ", output)
+            exit()
 
-                if output != ex.out
-                    falsified = true
-                    break
-                end
-            catch exception
+            if output != ex.out
                 falsified = true
                 break
             end
+            # catch exception
+            #     print("EXCEPTION!!", exception)
+            #     falsified = true
+            #     break
+            # end
         end
 
         if !falsified
@@ -271,23 +288,77 @@ function my_synth(problem::Problem, iterator::ProgramIterator)
     return nothing
 end
 
-function run_synthesis(grammar)
-    pairs = get_all_problem_grammar_pairs(Robots_2020)
+# function run_synthesis(grammar)
+#     problems = Karel_2018.get_all_problems()
+#     solved_problemos = 0
+#     println(problems[1])
+#     exit()
+#     for (i, pair) in enumerate(pairs)
+#         if(i < 2)
+#             println("Running problem number $i.")
+#             iterator = MyBU(grammar, :Start, max_cost_in_bank=15)
+#             solution = my_synth(pair.problem, iterator)
 
-    solved_problemos = 0
-    for (i, pair) in enumerate(pairs)
-        if(i < 2)
-            println("Running problem number $i.")
-            iterator = MyBU(grammar, :Start, max_cost_in_bank=15)
-            solution = my_synth(pair.problem, iterator)
+#             if !isnothing(solution)
+#                 @show "Solution: ", solution
+#                 solved_problemos += 1
+#             end
+#         end
+#     end
+# end # End run synthesis function
+function run_synthesis(pcfg)  # pcsg built from Karel grammar
 
-            if !isnothing(solution)
-                @show "Solution: ", solution
-                solved_problemos += 1
+    problems = Karel_2018.get_all_problems()  # ~10 IOExamples per problem:contentReference[oaicite:7]{index=7}
+    prob = problems[1]  # try one first
+
+    # run with your probabilistic bottom-up iterator
+    prog, hits = solve_one(prob, pcfg, 3)  # increase 15 if you need a bigger search radius
+    if isnothing(prog)
+        println("No program found. Best coverage: $hits / $(length(prob.spec))")
+    else
+        println("Solved with $hits / $(length(prob.spec))")
+        println("Program: ", rulenode2expr(prog, pcfg))
+    end
+end
+
+function count_matches(prog::AbstractRuleNode, prob::Problem, grammar)
+    hits = 0
+    for ex in prob.spec
+        # println(typeof(prog))
+        # frozen = HerbConstraints.freeze_state(prog)
+        # println(typeof(frozen), typeof(grammar), typeof(ex))
+        # println(grammar_karel)
+        out = Karel_2018.interpret(prog, grammar_karel, ex, Dict{Int,AbstractRuleNode}())  # Karel interpreter
+        hits += (out == ex.out) ? 1 : 0
+    end
+    return hits
+end
+
+function solve_one(prob::Problem, grammar, max_cost::Int)
+    it = MyBU(grammar, :Start; max_cost_in_bank = max_cost)
+    best_prog = nothing
+    best_hits = 0
+    nexp = length(prob.spec)
+
+    for (i, prog) in enumerate(it)
+        println("Program: ", rulenode2expr(prog, grammar))
+
+        hits = count_matches(prog, prob, grammar)
+        if hits > best_hits
+            best_hits = hits
+            best_prog = deepcopy(prog)
+
+            println("\n NEWWWWW RECORDDDDDd: $hits / $nexp (program #$i)\n")
+            println("Best program for now: ", rulenode2expr(prog, grammar))
+            println("actual holes: ", prog)
+            if hits == nexp
+                break  # full solution
             end
         end
     end
-end # End run synthesis function
+    println("BEST PROG BEFORE RETURN:", best_prog)
+    return best_prog, best_hits
+end
 
 function run_priority_robot_test(pcsg)
     pairs = get_all_problem_grammar_pairs(Robots_2020)
