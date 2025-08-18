@@ -1,9 +1,9 @@
-include("parse.jl")
+include("parseKarel.jl")
 include("grammar.jl")
 include("synthesis.jl")
 include("utils.jl")
 
-using .Parse
+using .ParseKarel
 using .Grammar
 using .Synthesis
 using .Utils
@@ -13,15 +13,15 @@ using HerbBenchmarks
 using HerbBenchmarks.Robots_2020
 
 # Example LLM responses
-llm_response_3 = "moveRight(); moveRight(); drop(); grab()"
-llm_response_2 = "IF(atRight(), moveDown(), moveRight()); grab()"
-llm_response_1 = "WHILE(notAtBottom(), moveDown()); drop()"
+llm_response_1 = "move turnleft move move"
+llm_response_2 = "WHILE(markersPresent pickMarker move turnLeft putMarker)"
+llm_response_3 = "WHILE(notAtBottom(), moveDown()); drop()"
 
 # Parse trees array
 parsed_trees = Vector{Union{Nothing, ParseTree}}(undef, 3)
 parsed_trees[1] = parse_llm_response(llm_response_1)
-parsed_trees[2] = parse_llm_response(llm_response_2)
-parsed_trees[3] = parse_llm_response(llm_response_3)
+# parsed_trees[2] = parse_llm_response(llm_response_2)
+# parsed_trees[3] = parse_llm_response(llm_response_3)
 
 
 grammar_robots = @csgrammar begin
@@ -67,18 +67,22 @@ end
 # Loop through each parsed tree
 for tree in parsed_trees
     if tree !== nothing
-        rule_counts = Utils.print_tree(tree)
+        rule_counts, counts_by_depth = Utils.print_tree(tree)
         println(rule_counts)
+        println(counts_by_depth)
+        M, depths, rules = Utils.counts_matrix(counts_by_depth)
+        Utils.pretty_print_counts(M, depths, rules)
+        exit()
         dict = construct_dict(rule_counts)
         #println(dict)
         pcsg = make_pcsg_from_dict(grammar_karel, dict)
         
         print_pcsg_rules(pcsg)
-
+        exit()
         #run_synthesis_tests(pcsg)
         #println(grammar_robots)
         println("TEST")
-        run_synthesis(pcsg)
+        run_synthesis_tests()
 
         # run_priority_robot_test(pcsg)
         exit()

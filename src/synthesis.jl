@@ -26,6 +26,21 @@ end
 const COST_PRECISION = 1e-6
 round_cost(x::Real) = trunc(Int,ceil(x))  # enforce consistent dictionary keys
 
+function print_bank_with_costs(iter::BottomUpIterator)
+    G = HerbSearch.get_grammar(iter.solver)
+    bank = get_bank(iter)
+
+    for cost in keys(bank)  # iterate in the bank's native order
+        println("\n=== Cost bucket: $cost ===")
+        for (t, vec) in bank[cost]
+            for (i, prog) in enumerate(vec)
+                expr = rulenode2expr(prog, G)
+                println("[$cost][$t][$i] $expr")
+            end
+        end
+        println("\n")
+    end
+end
 
 function HerbSearch.populate_bank!(iter::BottomUpIterator)::AbstractVector{AccessAddress}
     grammar = HerbSearch.get_grammar(iter.solver)
@@ -42,11 +57,23 @@ function HerbSearch.populate_bank!(iter::BottomUpIterator)::AbstractVector{Acces
             push!(get_bank(iter)[index][program_type], program) # Push to bank by it's log_prob and type
         end
     end
-
-    return [AccessAddress((index, t, x))
-            for (index, bucket) in get_bank(iter)
-            for (t, vec) in bucket
-            for x in 1:length(vec)]
+    # print_bank_with_costs(iter)
+    bank = get_bank(iter)
+    limit = iter.current_max_cost            # e.g., 2 at the start
+    addrs = AccessAddress[]
+    for index in sort!(collect(keys(bank)))  # ascending cost for stable behavior
+        bucket = bank[index]
+        for (t, vec) in bucket
+            for x in eachindex(vec)
+                push!(addrs, AccessAddress((index, t, x)))
+            end
+        end
+    end
+    return addrs
+    # return [AccessAddress((index, t, x))
+    #         for (index, bucket) in get_bank(iter)
+    #         for (t, vec) in bucket
+    #         for x in 1:length(vec)]
 end
 
 
@@ -161,7 +188,7 @@ function HerbSearch.combine(iter::MyBU, state)
     end
 
     # Sort based on precomputed total_cost
-    sorted_combinations = sort(scored_combinations; by = x -> x[2], rev=true)
+    sorted_combinations = sort(scored_combinations; by = x -> x[2])
     final = first.(sorted_combinations)  # Extract only CombineAddress objects
 
     if isempty(final)
@@ -173,7 +200,7 @@ function HerbSearch.combine(iter::MyBU, state)
     return final, state
 end
 
-function run_synthesis_tests(grammar)
+function run_synthesis_tests()
     # @testset "Bottom Up Search" begin
     #     iter = MyBU(grammar, :Start, nothing; max_depth=5)
     #     create_bank!(iter)
@@ -184,77 +211,89 @@ function run_synthesis_tests(grammar)
     #     #println("Combinations from combine: ", combinations)
     # end
 
-    
-
     @testset "Cost correctness and bank population" begin
         g = @csgrammar begin
             Int = Int + Int   # Rule 1
+            Int = Int - Int
+            Int = Int * Int
             Int = 1
+            Int = 2
         end
     
         rule_counts = Dict(
-            "Int->Int+Int" => 1,  # high cost
-            "Int->1" => 100       # low cost
+            "Int->Int+Int" => 1,  # very high cost 3.8
+            "Int->Int-Int" => 10,  # low cost 1.3
+            "Int->Int*Int" => 1, #very high cost 3.8
+            "Int->1" => 1,       # very high cost 3.8
+            "Int->2" => 10,       # low cost 1.3
         )
-    
+        # Real[3.807354922057604, 1.3479233034203069, 3.807354922057604, 3.807354922057604, 1.3479233034203069]
+
+        # Order of programs should be :
+        expected_programs  = [
+        "2", # 2
+        "1", # 4
+        "2-2",#6
+        "2+2", # 8
+        "2-1", # 8
+        "1-2", # 8
+        "2*2", # 8
+        "2+1", # 10
+        "1+2", # 10
+        "2-2-2", # 10
+        "1-1", # 10
+        "2-2-2", # 10
+        "2*1", # 10
+        "1*2", # 10
+        "2+2-2", #12
+        "1+1", # 12
+        "2-2+2", # 12
+        "2-2+2", # 12
+        "2-2-1", # 12
+        "2-1-2", # 12
+        "1-2-2", # 12
+        "2-2-1", # 12
+        "2+2-2", # 12
+        "2-1-2", # 12
+        "1-2-2", # 12 
+        "2-2*2", # 12
+        "2*2-2", # 12
+        "2*2-2", # 12
+        "1*1", # 12
+        "2-2*2" # 12    
+        ]
+
         pcfg = Grammar.make_pcsg_from_dict(g, Grammar.construct_dict(rule_counts))
-        iter = MyBU(pcfg, :Int, nothing; )
+        println(pcfg.log_probabilities)
+        iter = MyBU(pcfg, :Int; max_cost_in_bank = 15 )
     
-        # Test 1: Bank population
-        create_bank!(iter)
-        terms = populate_bank!(iter)
-    
-        bank = get_bank(iter)
-        @test haskey(bank, round_cost(0.0))  # terminals should be in cost bucket 0.0
-        @test length(bank[round_cost(0.0)]) > 0
-    
-        # Test 2: Manual cost check for CombineAddress
-        grammar = HerbSearch.get_grammar(iter.solver)
-        addr = CombineAddress(
-            UniformHole(BitVector([true, false]), []),
-            (AccessAddress((0.0, 1)), AccessAddress((0.0, 1)))
-        )
-        rule_cost = grammar.log_probabilities[1]
-        expected_cost = round_cost(rule_cost + 0.0 + 0.0)
-        computed_cost = round_cost(sum(x.addr[1] for x in addr.addrs) + rule_cost)
-        @test computed_cost == expected_cost
-    
-        # Test 3: Check rule prioritization via ascending cost
-        combinations, _ = combine(iter, init_combine_structure(iter))
-        @test length(combinations) > 0
-        costs = [sum(x.addr[1] for x in ca.addrs) + grammar.log_probabilities[findfirst(ca.op.domain)] for ca in combinations]
-        @test issorted(costs)
-    
-        # Test 4: new_address agrees with manual cost
-        auto_addr = new_address(iter, addr)
-        @test auto_addr.addr[1] == expected_cost
-    
-        # Test 5: combine never exceeds max cost
-        max_allowed_cost = init_combine_structure(iter)[:max_cost_in_bank]
-        for ca in combinations
-            total_cost = sum(x.addr[1] for x in ca.addrs) + grammar.log_probabilities[findfirst(ca.op.domain)]
-            @test total_cost <= max_allowed_cost
-        end
-    
-        # Test 6: only terminals in cost 0.0 bucket
-        terminals_only = bank[round_cost(0.0)]
-        for prog in terminals_only
-            expr = rulenode2expr(prog, grammar)
-            @test occursin("1", string(expr))  # or more generally, match known terminals
-        end
-    
-        # Test 7: cost order of yielded programs
-        costs_seen = Float64[]
-        for prog in iter
-            # Match against bank buckets to recover cost
-            for (cost, progs) in bank
-                if prog in progs
-                    push!(costs_seen, cost)
-                    break
+        programs = []
+        let G = HerbSearch.get_grammar(iter.solver)
+            for (i, prog) in enumerate(iter)
+                if i == 1
+                    @test replace(string(rulenode2expr(prog, G)), r"[\s\(\)]" => "") == "2"
                 end
+                if i == 2
+                    @test replace(string(rulenode2expr(prog, G)), r"[\s\(\)]" => "") == "1"
+                end
+                if i == 3 
+                    @test replace(string(rulenode2expr(prog, G)), r"[\s\(\)]" => "") == "2-2"
+                end
+                if i > 3 && i < 8
+                    @test replace(string(rulenode2expr(prog, G)), r"[\s\(\)]" => "") in expected_programs[4:7]
+                end
+                if i > 7 && i < 15
+                    @test replace(string(rulenode2expr(prog, G)), r"[\s\(\)]" => "") in expected_programs[8:14]
+                end
+                if i > 14 && i < 30
+                    @test replace(string(rulenode2expr(prog, G)), r"[\s\(\)]" => "") in expected_programs[15:29]
+                end
+                # if in 7:13
+                #     @test string(rulenode2expr(prog, G)) in expected_programs[7:13]
+                # end
+                push!(programs, string(rulenode2expr(prog, G)))
             end
         end
-        @test issorted(costs_seen)
     end    
 end
 
@@ -312,7 +351,7 @@ function run_synthesis(pcfg)  # pcsg built from Karel grammar
     prob = problems[1]  # try one first
 
     # run with your probabilistic bottom-up iterator
-    prog, hits = solve_one(prob, pcfg, 3)  # increase 15 if you need a bigger search radius
+    prog, hits = solve_one(prob, pcfg, 10)  # increase 15 if you need a bigger search radius
     if isnothing(prog)
         println("No program found. Best coverage: $hits / $(length(prob.spec))")
     else
@@ -342,7 +381,7 @@ function solve_one(prob::Problem, grammar, max_cost::Int)
 
     for (i, prog) in enumerate(it)
         println("Program: ", rulenode2expr(prog, grammar))
-
+        println(prog)
         hits = count_matches(prog, prob, grammar)
         if hits > best_hits
             best_hits = hits
