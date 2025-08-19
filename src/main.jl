@@ -70,7 +70,21 @@ for tree in parsed_trees
         rule_counts, counts_by_depth = Utils.print_tree(tree)
         println(rule_counts)
         println(counts_by_depth)
-        M, depths, rules = Utils.counts_matrix(counts_by_depth)
+
+        # Build and fill the numeric matrix (6 rows; all grammar rules as columns)
+        M, depths, rules = Utils.counts_matrix(counts_by_depth, grammar_karel; nrows=6)
+
+        # Print the whole matrix
+        println("\nMatrix M (size = ", size(M), "):")
+        println(M)
+
+        # Pretty table
+        Utils.pretty_print_counts(M, depths)
+
+        # Access a single entry: row 4, column 1
+        println("\nEntry M[4, 1] = ", M[4, 1])
+        exit()
+        M, depths, rules = Utils.counts_matrix(counts_by_depth, grammar_karel)
         Utils.pretty_print_counts(M, depths, rules)
         exit()
         dict = construct_dict(rule_counts)

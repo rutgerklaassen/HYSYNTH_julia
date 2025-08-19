@@ -1,7 +1,7 @@
 module Utils
-export read_response, print_tree, collect_counts_by_depth, counts_matrix, pretty_print_counts
+export read_response, print_tree, collect_counts_by_depth, counts_matrix, pretty_print_counts, make_rule_matrix
 import ..ParseKarel: ParseTree
-
+using HerbGrammar
 function read_response(path::String)::String
     isfile(path) || error("Response file not found: $path")
     return read(path, String)
@@ -65,38 +65,58 @@ function _walk_depth(node::ParseTree, depth::Int, acc::Dict{Int,Dict{String,Int}
     end
 end
 
-"""
-    counts_matrix(counts_by_depth) -> (M, depths, rules)
+function make_rule_matrix(grammar; nrows::Int = 6)
+    # rule_types[i] is the LHS for rules[i]
+    rules = [string(lhs, "->", rhs)
+             for (lhs, rhs) in zip(grammar.types, grammar.rules)]
+    rules[3] = "Block->(Action; Block)"
+    println(rules)
 
-Build a depth × rule matrix `M` where M[i,j] is the frequency of `rules[j]` at `depths[i]`.
-"""
-function counts_matrix(counts_by_depth::Dict{Int, Dict{String, Int}})
-    depths = sort(collect(keys(counts_by_depth)))
-    # collect unique rules across all depths
-    rules = sort!(collect(Set(Iterators.flatten(keys.(values(counts_by_depth))))))
-    M = zeros(Int, length(depths), length(rules))
-    for (i, d) in enumerate(depths)
-        row = counts_by_depth[d]
-        for (j, r) in enumerate(rules)
-            M[i, j] = get(row, r, 0)
-        end
-    end
-    return M, depths, rules
+    rule_index = Dict(r => i for (i, r) in enumerate(rules))
+    M = zeros(Int, nrows, length(rules))
+
+    return M, rules, rule_index
 end
 
+
+"""
+    counts_matrix(counts_by_depth, grammar; nrows=6) -> (M, depths, rules)
+
+Build a depth × rule matrix `M` where M[i,j] is the frequency of `rules[j]` at depth i.
+Rows are fixed to depths 1..nrows.
+Unknown rule strings in `counts_by_depth` (not present in `grammar`) are ignored.
+"""
+function counts_matrix(counts_by_depth::Dict{Int, Dict{String, Int}}, grammar; nrows::Int = 6)
+    M, rules, rule_index = make_rule_matrix(grammar; nrows=nrows)
+    println(counts_by_depth)
+    println(rule_index)
+    for (depth, d) in counts_by_depth
+        1 <= depth <= nrows || continue
+        println(depth, d)
+        for (rule_str, cnt) in d
+            j = get(rule_index, rule_str, 0)
+            j == 0 && continue           # skip rules not in the grammar
+            M[depth, j] += cnt
+        end
+    end
+
+    depths = collect(1:nrows)
+    return M, depths, rules
+end
 """
     pretty_print_counts(M, depths, rules)
 
 Nicely print the Rule × Depth table like in your example (depths as rows, rules as columns).
 """
-function pretty_print_counts(M::AbstractMatrix, depths::Vector{Int}, rules::Vector{String})
-    # simple spacing
-    colw = maximum(length, rules)
-    header = rpad("", 4) * join(rpad.(rules, colw+2), "")
+function pretty_print_counts(M::AbstractMatrix, depths::Vector{Int})
+    ncols = size(M, 2)
+    # header with column numbers
+    header = rpad("", 4) * join([lpad(string(j), 4) for j in 1:ncols], " ")
     println(header)
+    # each row
     for (i, d) in enumerate(depths)
-        rowvals = [lpad(string(M[i,j]), colw) * "  " for j in eachindex(rules)]
-        println(lpad(string(d)*".", 4), join(rowvals, ""))
+        rowvals = [lpad(string(M[i,j]), 4) for j in 1:ncols]
+        println(lpad(string(d)*".", 4), " ", join(rowvals, " "))
     end
 end
 
