@@ -1,5 +1,5 @@
-module Synthesis
-export run_synthesis_tests, run_synthesis, run_priority_robot_test
+module Hysynth
+export run_hysynth_tests, run_hysynth, run_priority_robot_test
 
 using HerbGrammar, HerbSearch, HerbCore, HerbConstraints, HerbSpecification, HerbBenchmarks, Test
 using DataStructures: DefaultDict
@@ -9,7 +9,7 @@ using HerbBenchmarks.Karel_2018
 import ..Grammar
 import HerbSearch: get_bank
 
-
+############## HYSYNTH ################
 @programiterator MyBU(bank=DefaultDict{Int,DefaultDict}(() -> (DefaultDict{Symbol,AbstractVector{AbstractRuleNode}}(() -> AbstractRuleNode[]))),
     max_cost_in_bank=0,
     current_max_cost = 2,
@@ -200,7 +200,8 @@ function HerbSearch.combine(iter::MyBU, state)
     return final, state
 end
 
-function run_synthesis_tests()
+
+function run_hysynth_tests()
     # @testset "Bottom Up Search" begin
     #     iter = MyBU(grammar, :Start, nothing; max_depth=5)
     #     create_bank!(iter)
@@ -298,6 +299,12 @@ function run_synthesis_tests()
 end
 
 
+
+
+
+
+
+
 function my_synth(problem::Problem, iterator::ProgramIterator)
     for (i, program) ∈ enumerate(iterator)
         expr = rulenode2expr(program, HerbSearch.get_grammar(iterator.solver))
@@ -327,25 +334,8 @@ function my_synth(problem::Problem, iterator::ProgramIterator)
     return nothing
 end
 
-# function run_synthesis(grammar)
-#     problems = Karel_2018.get_all_problems()
-#     solved_problemos = 0
-#     println(problems[1])
-#     exit()
-#     for (i, pair) in enumerate(pairs)
-#         if(i < 2)
-#             println("Running problem number $i.")
-#             iterator = MyBU(grammar, :Start, max_cost_in_bank=15)
-#             solution = my_synth(pair.problem, iterator)
 
-#             if !isnothing(solution)
-#                 @show "Solution: ", solution
-#                 solved_problemos += 1
-#             end
-#         end
-#     end
-# end # End run synthesis function
-function run_synthesis(pcfg)  # pcsg built from Karel grammar
+function run_hysynth(pcfg)  # pcsg built from Karel grammar
 
     problems = Karel_2018.get_all_problems()  # ~10 IOExamples per problem:contentReference[oaicite:7]{index=7}
     prob = problems[1]  # try one first
@@ -445,14 +435,14 @@ function run_priority_robot_test(pcsg)
 
     println("\n🟢 Running with GOOD guidance...\n")
     good_pcfg = Grammar.make_pcsg_from_dict(base_grammar, Grammar.construct_dict(good_counts))
-    #run_synthesis(good_pcfg)
+    #run_hysynth(good_pcfg)
     #@show good_pcfg.log_probabilities
 
     println("\n🔴 Running with BAD guidance...\n")
     bad_pcfg = Grammar.make_pcsg_from_dict(base_grammar, Grammar.construct_dict(bad_counts))
     println(bad_pcfg.log_probabilities)
 
-    run_synthesis(bad_pcfg)
+    run_hysynth(bad_pcfg)
     #@show bad_pcfg.rules
     #@show bad_pcfg.log_probabilities
 

@@ -1,11 +1,13 @@
 include("parseKarel.jl")
 include("grammar.jl")
-include("synthesis.jl")
+include("hysynth.jl")
 include("utils.jl")
+include("depth_based_synthesis.jl")
 
 using .ParseKarel
 using .Grammar
-using .Synthesis
+using .Hysynth
+using .Depth_synthesis
 using .Utils
 using HerbSearch, HerbCore, HerbGrammar, HerbSpecification
 
@@ -72,32 +74,27 @@ for tree in parsed_trees
         println(counts_by_depth)
 
         # Build and fill the numeric matrix (6 rows; all grammar rules as columns)
-        M, depths, rules = Utils.counts_matrix(counts_by_depth, grammar_karel; nrows=6)
+        M, rules = Utils.counts_matrix(counts_by_depth, grammar_karel; nrows=6)
 
         # Print the whole matrix
         println("\nMatrix M (size = ", size(M), "):")
         println(M)
+        C = Grammar.frequencies_to_costs(M, rules; alpha=1.0, eps=1e-3)
+        println("Cost matrix size: ", size(C))
 
         # Pretty table
-        Utils.pretty_print_counts(M, depths)
+        Utils.pretty_print_counts(C)
 
-        # Access a single entry: row 4, column 1
-        println("\nEntry M[4, 1] = ", M[4, 1])
-        exit()
-        M, depths, rules = Utils.counts_matrix(counts_by_depth, grammar_karel)
-        Utils.pretty_print_counts(M, depths, rules)
-        exit()
-        dict = construct_dict(rule_counts)
+        # dict = construct_dict(rule_counts)
         #println(dict)
-        pcsg = make_pcsg_from_dict(grammar_karel, dict)
+        # pcsg = make_pcsg_from_dict(grammar_karel, dict)
         
-        print_pcsg_rules(pcsg)
-        exit()
+        # print_pcsg_rules(pcsg)
         #run_synthesis_tests(pcsg)
         #println(grammar_robots)
         println("TEST")
-        run_synthesis_tests()
-
+        #run_hysynth_tests()
+        run_depth_synthesis_tests()
         # run_priority_robot_test(pcsg)
         exit()
     else

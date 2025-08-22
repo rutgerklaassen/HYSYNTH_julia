@@ -80,19 +80,16 @@ end
 
 
 """
-    counts_matrix(counts_by_depth, grammar; nrows=6) -> (M, depths, rules)
+    counts_matrix(counts_by_depth, grammar; nrows=6) -> (M, rules)
 
-Build a depth × rule matrix `M` where M[i,j] is the frequency of `rules[j]` at depth i.
-Rows are fixed to depths 1..nrows.
-Unknown rule strings in `counts_by_depth` (not present in `grammar`) are ignored.
+Build a dense depth × rule matrix `M` where row `d` **is** tree depth `d` (1..nrows),
+and column `j` corresponds to `rules[j]`. Unknown rule strings are ignored.
 """
 function counts_matrix(counts_by_depth::Dict{Int, Dict{String, Int}}, grammar; nrows::Int = 6)
     M, rules, rule_index = make_rule_matrix(grammar; nrows=nrows)
-    println(counts_by_depth)
-    println(rule_index)
+
     for (depth, d) in counts_by_depth
         1 <= depth <= nrows || continue
-        println(depth, d)
         for (rule_str, cnt) in d
             j = get(rule_index, rule_str, 0)
             j == 0 && continue           # skip rules not in the grammar
@@ -100,23 +97,21 @@ function counts_matrix(counts_by_depth::Dict{Int, Dict{String, Int}}, grammar; n
         end
     end
 
-    depths = collect(1:nrows)
-    return M, depths, rules
+    return M, rules
 end
-"""
-    pretty_print_counts(M, depths, rules)
 
-Nicely print the Rule × Depth table like in your example (depths as rows, rules as columns).
 """
-function pretty_print_counts(M::AbstractMatrix, depths::Vector{Int})
-    ncols = size(M, 2)
-    # header with column numbers
-    header = rpad("", 4) * join([lpad(string(j), 4) for j in 1:ncols], " ")
+    pretty_print_counts(M)
+
+Pretty-print the dense depth × rule matrix where row index == depth.
+"""
+function pretty_print_counts(M::AbstractMatrix)
+    nrows, ncols = size(M)
+    header = rpad("", 4) * join([lpad(string(j), 6) for j in 1:ncols], " ")
     println(header)
-    # each row
-    for (i, d) in enumerate(depths)
-        rowvals = [lpad(string(M[i,j]), 4) for j in 1:ncols]
-        println(lpad(string(d)*".", 4), " ", join(rowvals, " "))
+    for d in 1:nrows
+        rowvals = [lpad(string(round(M[d, j], digits=2)), 6) for j in 1:ncols]
+        println(lpad(string(d) * ".", 4), " ", join(rowvals, " "))
     end
 end
 
