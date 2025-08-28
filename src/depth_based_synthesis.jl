@@ -10,13 +10,19 @@ using HerbBenchmarks.Karel_2018
 
 import ..Grammar
 import HerbSearch: get_bank
-
+# --- fake program tree selecting rules 1 and 3 (unary chain is enough) ---
+# Minimal StateHole-like struct for the test:
+struct MiniNode
+    j::Int
+    children::Vector{MiniNode}
+end
 @programiterator MyDepthBU(
     bank = DefaultDict{Int,DefaultDict}(() -> (DefaultDict{Symbol,AbstractVector{AbstractRuleNode}}(() -> AbstractRuleNode[]))),
     max_cost_in_bank = 0,
     current_max_cost = 2,
     seen_programs = Set{UniformHole}(),  
-    costMatrix = Matrix{Float64}(undef, 0, 0)  
+    costMatrix = Matrix{Float64}(undef, 0, 0),
+    baseCostMatrix = Matrix{Float64}(undef, 0, 0)
 ) <: BottomUpIterator
 
 function HerbSearch.init_combine_structure(iter::MyDepthBU)
@@ -78,7 +84,7 @@ function program_total_cost(iter::MyDepthBU, prog::UniformHole, depth::Int=1)
 end
 
 # Same signature as your UniformHole version, but for StateHole
-function program_total_cost(iter::MyDepthBU, prog::HerbSearch.StateHole, depth::Int=1)
+function program_total_cost(iter::MyDepthBU, prog::HerbConstraints.StateHole, depth::Int=1)
     # Clamp depth to the cost matrix
     d = clamp(depth, 1, size(iter.costMatrix, 1))
 
@@ -215,7 +221,165 @@ function pretty_print_counts(M::AbstractMatrix)
     end
 end
 
+# one-hot rule index and children
+_ruleindex(u::HerbConstraints.StateHole) = begin
+    j = findfirst(u.domain)
+    @assert j !== nothing "Statehole has empty/invalid domain"
+    j
+end
+_children(u::HerbConstraints.StateHole) = u.children
+
+# Count number of rules used in a StateHole tree
+function program_rule_count(node::HerbConstraints.StateHole)
+    total = 1                       # count this node
+    @inbounds for c in node.children
+        total += program_rule_count(c)
+    end
+    return total
+end
+
+# Bump Fit ONLY along the current program’s tree
+function update_fit_from_program!(Fit::AbstractMatrix{Float64},
+                                  prog::HerbConstraints.StateHole,
+                                  hits::Int, N::Int; depth::Int=1)
+    cov = (N == 0) ? 0.0 : clamp(hits / N, 0.0, 1.0)
+    _upd_fit!(Fit, prog, cov, depth);  return Fit
+end
+
+function _upd_fit!(Fit, node::HerbConstraints.StateHole, cov::Float64, depth::Int)
+    d = clamp(depth, 1, size(Fit,1))
+    j = _ruleindex(node)
+    Fit[d, j] = max(Fit[d, j], cov)
+    for c in _children(node)
+        _upd_fit!(Fit, c, cov, depth + 1)
+    end
+end
+
+
+function probe_update_costs!(M::AbstractMatrix{Float64},   # destination (current)
+                             C0::AbstractMatrix{Float64},  # BASE costs (fixed)
+                             G,
+                             Fit::AbstractMatrix{<:Real})
+    D, R = size(M)
+    # @assert size(C0)  == (D, R)
+    # @assert size(Fit) == (D, R)
+    types = G.types
+    for d in 1:D
+        for t in unique(types)
+            idxs = findall(types .== t)
+
+            # Cost_d(r) = -log_2(P_d(r))
+            # P_base_d(r) = 2 ^ -C0_(d,r)
+            # So the PROBE formula can now be rewritten in terms of costs :
+            # (2 ^ -C0(d,r)) ^ 1 - FIT_d(r) = 2 ^ -((1 - FIT) * C0(d,r))
+            #  DEFINITION : b(d, r) === -((1 - FIT) * C0(d,r)) 
+            # So now we have the full update formula for cost 
+            # C'[d,r] = -log_2(P'_d(r)) = -log_2( 2^-b(d,r) / Z) where Z is the sum of 2^-b(d,r) over all same LHS at same depth
+            # because we have -log_2(a / b) = -log_2 (a) + log_2(b) 
+            # We get -log_2(2^-b(d,r)) + (Z) = b(d,r) + log_ 2 (Z)
+
+            # Here we calculate the b(d,r) for every same lhs
+            b = [max(0.0, 1 - clamp(Fit[d,j], 0.0, 1.0)) * C0[d,j] for j in idxs]
+
+            # Here we compute Z (so all the b's added up)
+            m = minimum(b)
+            K = sum(2.0 ^ (-(x - m)) for x in b)  # terms are now ≤ 1, no underflow
+            Z = -m + log2(K)
+            # final updated costs
+            @inbounds for (k, j) in enumerate(idxs)
+                M[d, j] = b[k] + Z
+            end
+
+        end
+    end
+    return M
+end
+
+function run_depth_synthesis(M, G)  # pcsg built from Karel grammar
+    pretty_print_counts(M)
+
+    problems = Karel_2018.get_all_problems()  # ~10 IOExamples per problem
+    prob = problems[1]  # try one first
+
+    # run with your probabilistic bottom-up iterator
+    prog, hits = solve_one(prob, M, G, 10)  # increase 15 if you need a bigger search radius
+    if isnothing(prog)
+        println("No program found. Best coverage: $hits / $(length(prob.spec))")
+    else
+        println("Solved with $hits / $(length(prob.spec))")
+        println("Program: ", rulenode2expr(prog, G))
+    end
+end
+
+function count_matches(prog::AbstractRuleNode, prob::Problem, grammar)
+    hits = 0
+    for ex in prob.spec
+        # println(typeof(prog))
+        # frozen = HerbConstraints.freeze_state(prog)
+        # println(typeof(frozen), typeof(grammar), typeof(ex))
+        # println(grammar_karel)
+        out = Karel_2018.interpret(prog, grammar_karel, ex, Dict{Int,AbstractRuleNode}())  # Karel interpreter
+        hits += (out == ex.out) ? 1 : 0
+    end
+    return hits, length(prob.spec)
+end
+
+function solve_one(prob::Problem, M, grammar, max_cost::Int)
+    it = MyDepthBU(grammar, :Start; max_cost_in_bank = max_cost, costMatrix = M)
+
+    C0  = copy(M)                                        # BASE costs (fixed)
+    Fit = zeros(Float64, size(M,1), length(grammar.rules))  # D×R, starts at 0
+
+    best_prog = nothing
+    best_hits = 0
+    best_size = typemax(Int)
+
+
+    for (i, prog) in enumerate(it)
+        println("Program: ", rulenode2expr(prog, grammar))
+        hits, N = count_matches(prog, prob, grammar)
+        size_now = program_rule_count(prog)
+        trigger = false
+        if hits > best_hits
+            best_hits = hits
+            best_size = size_now
+            best_prog = deepcopy(prog)
+            trigger = true
+        elseif hits == best_hits && size_now < best_size
+            best_size = size_now
+            best_prog = deepcopy(prog)
+            trigger = true
+        end
+
+        # 3) Update ONLY when triggered
+        if trigger
+            update_fit_from_program!(Fit, prog, hits, N)
+            probe_update_costs!(it.costMatrix, C0, grammar, Fit)
+
+            if hits == N; break; end
+        end
+    end
+    println("BEST PROG BEFORE RETURN:", best_prog)
+    return best_prog, best_hits
+end
+
+###################################################
+###################################################
+################### TESTS #########################
+###################################################
+###################################################
+###################################################
+
 function run_depth_synthesis_tests()
+    function probe_update(p_u::Vector{Float64}, used::Vector{Bool}, fit::Float64)
+        @assert 0.0 ≤ fit ≤ 1.0
+        @assert length(p_u) == length(used)
+        weights = [p_u[i]^(1.0 - (used[i] ? fit : 0.0)) for i in eachindex(p_u)]
+        Z = sum(weights)
+        p_new = weights ./ Z
+        costs = round.(Int, .*(-log.(p_new)))
+        return p_new, costs
+    end
 
     @testset "populate_bank! costless bucket" begin
         # Tiny grammar with two terminals and one nonterminal rule
@@ -557,9 +721,6 @@ function run_depth_synthesis_tests()
         iter = MyDepthBU(g, :Int; max_cost_in_bank = 15, costMatrix = M )
         costs = []
         for (i, prog) in enumerate(iter)
-            # println(prog)
-            # println("PROGRAM #", i, " ",string(rulenode2expr(prog, g)))
-            # println("COST!", program_total_cost(iter, prog))
             if i > 2
                 push!(costs, program_total_cost(iter, prog))
             end
@@ -569,62 +730,76 @@ function run_depth_synthesis_tests()
         end
         @test issorted(costs)        
     end
-end
-
-
-function run_depth_synthesis(M, G)  # pcsg built from Karel grammar
-
-    problems = Karel_2018.get_all_problems()  # ~10 IOExamples per problem
-    prob = problems[1]  # try one first
-
-    # run with your probabilistic bottom-up iterator
-    prog, hits = solve_one(prob, M, G, 10)  # increase 15 if you need a bigger search radius
-    if isnothing(prog)
-        println("No program found. Best coverage: $hits / $(length(prob.spec))")
-    else
-        println("Solved with $hits / $(length(prob.spec))")
-        println("Program: ", rulenode2expr(prog, pcfg))
-    end
-end
-
-function count_matches(prog::AbstractRuleNode, prob::Problem, grammar)
-    hits = 0
-    for ex in prob.spec
-        # println(typeof(prog))
-        # frozen = HerbConstraints.freeze_state(prog)
-        # println(typeof(frozen), typeof(grammar), typeof(ex))
-        # println(grammar_karel)
-        out = Karel_2018.interpret(prog, grammar_karel, ex, Dict{Int,AbstractRuleNode}())  # Karel interpreter
-        hits += (out == ex.out) ? 1 : 0
-    end
-    return hits
-end
-
-function solve_one(prob::Problem, M, grammar, max_cost::Int)
-    it = MyDepthBU(grammar, :Start; max_cost_in_bank = max_cost, costMatrix = M)
-    best_prog = nothing
-    best_hits = 0
-    nexp = length(prob.spec)
-
-    for (i, prog) in enumerate(it)
-        println("Program: ", rulenode2expr(prog, grammar))
-        println(prog)
-        hits = count_matches(prog, prob, grammar)
-        if hits > best_hits
-            best_hits = hits
-            best_prog = deepcopy(prog)
-
-            println("\n NEWWWWW RECORDDDDDd: $hits / $nexp (program #$i)\n")
-            println("Best program for now: ", rulenode2expr(prog, grammar))
-            println("actual holes: ", prog)
-            if hits == nexp
-                break  # full solution
-            end
+    @testset "Cost matrix & PROBE-style updates" begin
+        # Grammar with exactly three rules for one type S:
+        #   S = x()           (terminal)
+        #   S = y()           (terminal)
+        #   S = node(S, S)    (nonterminal)
+        G = @csgrammar begin
+            S = x()
+            S = y()
+            S = node(S, S)
         end
+
+        R = length(G.rules)
+
+        # Indices of rules whose LHS is :S (all of them here).
+        S_rule_idxs = findall(G.types .== :S)
+        @test length(S_rule_idxs) == 3
+
+        # Helper: convert a cost row to normalized probabilities on a subset of columns
+        costrow_to_probs = function(costrow::AbstractVector{<:Real}, cols::AbstractVector{Int})
+            v = 2.0 .^ (-costrow[cols])
+            v ./ sum(v)
+        end
+
+        # Base probabilities for the 3 rules at each depth (sum to 1 so Fit=0 is a no-op)
+        p0 = [0.5, 0.3, 0.2]
+        C_A = -log2.(p0)  # base costs: -log2 p
+
+        # Two-depth matrices (D=2) so we also touch the depth loop in probe_update_costs!
+        D = 2
+        C0 = fill(1000.0, D, R)   # base costs (big default elsewhere to avoid accidental mass)
+        M  = similar(C0)          # destination for updated costs
+        Fit = zeros(Float64, D, R)
+
+        # Same base distribution at both depths
+        C0[1, S_rule_idxs] .= C_A
+        C0[2, S_rule_idxs] .= C_A
+
+        # 1) Fit = 0 everywhere → updated costs equal the base costs (since probs already sum to 1 per LHS)
+        probe_update_costs!(M, C0, G, Fit)
+        @test isapprox(costrow_to_probs(M[1, :], S_rule_idxs), p0; atol=1e-12, rtol=1e-12)
+        @test isapprox(costrow_to_probs(M[2, :], S_rule_idxs), p0; atol=1e-12, rtol=1e-12)
+
+        # 2) Boost the middle rule at depth 1: Fit = [0.0, 0.6, 0.0]
+        #    PROBE math: P'_d(r) ∝ P_base_d(r)^(1 - Fit_d(r))
+        Fit .= 0.0
+        Fit[1, S_rule_idxs] .= [0.0, 0.6, 0.0]
+        probe_update_costs!(M, C0, G, Fit)
+
+        p_expected = p0 .^ (1 .- [0.0, 0.6, 0.0]); p_expected ./= sum(p_expected)
+        @test isapprox(costrow_to_probs(M[1, :], S_rule_idxs), p_expected; atol=1e-12, rtol=1e-12)
+        @test costrow_to_probs(M[1, :], S_rule_idxs)[2] > p0[2]        # boosted rule got more probable
+        @test abs(sum(costrow_to_probs(M[1, :], S_rule_idxs)) - 1.0) < 1e-12
+
+        # 3) Depth separation: changing Fit at depth 1 doesn't perturb depth 2
+        @test isapprox(costrow_to_probs(M[2, :], S_rule_idxs), p0; atol=1e-12, rtol=1e-12)
+
+        # 4) Sanity on arity lookup: use childtypes, not a nonexistent G.arity
+        #    node(S, S) must have arity 2; terminals have arity 0
+        arities = map(j -> length(G.childtypes[j]), 1:R)
+        @test sort(arities) == [0, 0, 2]
     end
-    println("BEST PROG BEFORE RETURN:", best_prog)
-    return best_prog, best_hits
 end
+
+###################################################
+###################################################
+################### END TESTS #####################
+###################################################
+###################################################
+###################################################
+
 
 
 end # module

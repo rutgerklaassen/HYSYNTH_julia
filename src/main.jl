@@ -94,7 +94,8 @@ for tree in parsed_trees
         #println(grammar_robots)
         println("TEST")
         #run_hysynth_tests()
-        run_depth_synthesis_tests()
+        # run_depth_synthesis_tests()
+        run_depth_synthesis(C, grammar_karel)
         # run_priority_robot_test(pcsg)
         exit()
     else
