@@ -314,6 +314,9 @@ end
 function count_matches(prog::AbstractRuleNode, prob::Problem, grammar)
     hits = 0
     for ex in prob.spec
+        println(ex)
+        println(typeof(ex))
+        exit()
         # println(typeof(prog))
         # frozen = HerbConstraints.freeze_state(prog)
         # println(typeof(frozen), typeof(grammar), typeof(ex))

@@ -1,0 +1,53 @@
+def run() {
+  ifelse(right_is_clear()) {
+    if(left_is_clear()) {
+      turn_left()
+    }
+  }
+  else {
+    turn_right()
+  }
+}
+def run() {
+  repeat(0) {
+    repeat(15) {
+      repeat(0) {
+        move()
+      }
+    }
+  }
+}
+def run() {
+  repeat(19) {
+    ifelse(front_is_clear()) {
+      while(left_is_clear()) {
+        pick_marker()
+      }
+    }
+    else {
+      put_marker()
+      turn_left()
+    }
+  }
+}
+def run() {
+  if(not front_is_clear()) {
+    ifelse(left_is_clear()) {
+      put_marker()
+    }
+    else {
+      if(left_is_clear()) {
+        pick_marker()
+      }
+    }
+  }
+}
+def run() {
+  repeat(12) {
+    while(not right_is_clear()) {
+      move()
+    }
+  }
+  
+  turn_left()
+}
