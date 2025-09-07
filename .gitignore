@@ -3,3 +3,6 @@ OLD2.jl
 response.txt
 test.jl
 test5.py
+*.npz
+*.jl
+*.jls

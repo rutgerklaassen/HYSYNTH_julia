@@ -1,3 +1,4 @@
+
 module Depth_synthesis
 
 export run_depth_synthesis_tests, run_depth_synthesis, run_priority_robot_test
@@ -7,6 +8,8 @@ using DataStructures: DefaultDict
 using Printf
 using HerbBenchmarks.Karel_2018
 
+include("traces.jl")
+using .Traces
 
 import ..Grammar
 import HerbSearch: get_bank
@@ -255,7 +258,6 @@ function _upd_fit!(Fit, node::HerbConstraints.StateHole, cov::Float64, depth::In
     end
 end
 
-
 function probe_update_costs!(M::AbstractMatrix{Float64},   # destination (current)
                              C0::AbstractMatrix{Float64},  # BASE costs (fixed)
                              G,
@@ -296,8 +298,75 @@ function probe_update_costs!(M::AbstractMatrix{Float64},   # destination (curren
 end
 
 function run_depth_synthesis(M, G)  # pcsg built from Karel grammar
-    pretty_print_counts(M)
+    exs, trs, meta = load_packed_with_traces("examples_packed.npz")
 
+    println("Loaded ", length(exs), " examples")
+    println("Meta: ", meta)
+
+    # Check grouping
+    k = meta["num_examples_per_code"]
+    problems, problem_traces = group_examples_and_traces(exs, trs; num_examples_per_code=k)
+
+    # --- Pretty-print one program + its k traces (frames included) ---
+    # 1) normalize k (npz scalar may load as 0-d array)
+    k = Int(k isa AbstractArray ? k[] : k)
+
+    # 2) choose which program to inspect
+    prog_idx = 1  # change to any 1..length(problems)
+
+    println("\n==============================")
+    println("PROGRAM #", prog_idx)
+
+    # If codes were packed, show token ids of this program
+    if haskey(meta, "codes_padded") && haskey(meta, "code_lengths")
+        codes_padded = meta["codes_padded"]
+        code_lengths = meta["code_lengths"]
+
+        # any of the k examples in the group share the same program;
+        # take the first example's row in the flat arrays
+        start = (prog_idx - 1) * k + 1
+        L = Int(code_lengths[start])
+        tok_ids = vec(codes_padded[start, 1:L])
+
+        println("Token IDs: ", tok_ids)
+    else
+        println("(No token ids found in NPZ: only traces will be shown.)")
+    end
+
+    # Helper to show a Karel state (replace with your ASCII renderer if you have one)
+    show_state(s::HerbBenchmarks.Karel_2018.KarelState) = (show(s); println())
+
+    # 3) print all k traces (every frame)
+    println("\nTRACES (k = ", k, ")")
+    trs_for_prog = problem_traces[prog_idx]  # Vector{Trace{KarelState}} length k
+    exs_for_prog = problems[prog_idx].spec   # Vector{IOExample} length k (to sanity-check ends)
+
+    @assert length(trs_for_prog) == k
+    @assert length(exs_for_prog) == k
+
+    for tix in 1:k
+        tr = trs_for_prog[tix]
+        ex = exs_for_prog[tix]
+
+        println("\n--- trace ", tix, " ---")
+        println("frames: ", length(tr.exec_path))
+
+        # verify first/last match the IOExample (useful integrity check)
+        println("matches input?  ", tr.exec_path[1]  == ex.in[:_arg_1])
+        println("matches output? ", tr.exec_path[end] == ex.out)
+
+        # print every frame (initial is frame 0)
+        for (f, st) in enumerate(tr.exec_path)
+            println("frame ", f-1, ":")
+            show_state(st)
+        end
+    end
+    println("==============================\n")
+    println("Loaded ", length(problems), " programs, each with ", k, " examples")
+    println("First problem has ", length(problem_traces[1]), " traces")
+    println("First trace length = ", length(problem_traces[1][1].exec_path))
+
+    exit()
     problems = Karel_2018.get_all_problems()  # ~10 IOExamples per problem
     prob = problems[1]  # try one first
 
@@ -354,7 +423,7 @@ function solve_one(prob::Problem, M, grammar, max_cost::Int)
             trigger = true
         end
 
-        # 3) Update ONLY when triggered
+        #Update ONLY when triggered
         if trigger
             update_fit_from_program!(Fit, prog, hits, N)
             probe_update_costs!(it.costMatrix, C0, grammar, Fit)
