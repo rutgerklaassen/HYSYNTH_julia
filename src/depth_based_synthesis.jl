@@ -7,9 +7,12 @@ using HerbGrammar, HerbSearch, HerbCore, HerbConstraints, HerbSpecification, Her
 using DataStructures: DefaultDict
 using Printf
 using HerbBenchmarks.Karel_2018
+using Serialization 
 
 include("traces.jl")
 using .Traces
+include("karel_utils.jl")
+using .KarelUtils
 
 import ..Grammar
 import HerbSearch: get_bank
@@ -157,8 +160,6 @@ function HerbSearch.combine(iter::MyDepthBU, state)
         return combination -> child_types == [x[2] for x in combination]
     end
 
-
-
     function check_seen_programs(iter::BottomUpIterator, addr::CombineAddress)
         for program in iter.seen_programs
             if HerbConstraints.pattern_match(program, reconstruct_program(iter, addr)) == HerbConstraints.PatternMatchSuccess()
@@ -167,7 +168,6 @@ function HerbSearch.combine(iter::MyDepthBU, state)
         end
         return false
     end
-
 
     # One-pass tuple collection with precomputed cost
     scored_combinations = Tuple{CombineAddress, Int}[]
@@ -298,102 +298,56 @@ function probe_update_costs!(M::AbstractMatrix{Float64},   # destination (curren
 end
 
 function run_depth_synthesis(M, G)  # pcsg built from Karel grammar
-    exs, trs, meta = load_packed_with_traces("examples_packed.npz")
+    # load in from our traces file 
+    ds = deserialize("karel_dataset.jls")
 
-    println("Loaded ", length(exs), " examples")
-    println("Meta: ", meta)
-
-    # Check grouping
-    k = meta["num_examples_per_code"]
-    problems, problem_traces = group_examples_and_traces(exs, trs; num_examples_per_code=k)
-
-    # --- Pretty-print one program + its k traces (frames included) ---
-    # 1) normalize k (npz scalar may load as 0-d array)
-    k = Int(k isa AbstractArray ? k[] : k)
-
-    # 2) choose which program to inspect
-    prog_idx = 1  # change to any 1..length(problems)
-
-    println("\n==============================")
-    println("PROGRAM #", prog_idx)
-
-    # If codes were packed, show token ids of this program
-    if haskey(meta, "codes_padded") && haskey(meta, "code_lengths")
-        codes_padded = meta["codes_padded"]
-        code_lengths = meta["code_lengths"]
-
-        # any of the k examples in the group share the same program;
-        # take the first example's row in the flat arrays
-        start = (prog_idx - 1) * k + 1
-        L = Int(code_lengths[start])
-        tok_ids = vec(codes_padded[start, 1:L])
-
-        println("Token IDs: ", tok_ids)
-    else
-        println("(No token ids found in NPZ: only traces will be shown.)")
-    end
-
-    # Helper to show a Karel state (replace with your ASCII renderer if you have one)
-    show_state(s::HerbBenchmarks.Karel_2018.KarelState) = (show(s); println())
-
-    # 3) print all k traces (every frame)
-    println("\nTRACES (k = ", k, ")")
-    trs_for_prog = problem_traces[prog_idx]  # Vector{Trace{KarelState}} length k
-    exs_for_prog = problems[prog_idx].spec   # Vector{IOExample} length k (to sanity-check ends)
-
-    @assert length(trs_for_prog) == k
-    @assert length(exs_for_prog) == k
-
-    for tix in 1:k
-        tr = trs_for_prog[tix]
-        ex = exs_for_prog[tix]
-
-        println("\n--- trace ", tix, " ---")
-        println("frames: ", length(tr.exec_path))
-
-        # verify first/last match the IOExample (useful integrity check)
-        println("matches input?  ", tr.exec_path[1]  == ex.in[:_arg_1])
-        println("matches output? ", tr.exec_path[end] == ex.out)
-
-        # print every frame (initial is frame 0)
-        for (f, st) in enumerate(tr.exec_path)
-            println("frame ", f-1, ":")
-            show_state(st)
-        end
-    end
-    println("==============================\n")
-    println("Loaded ", length(problems), " programs, each with ", k, " examples")
-    println("First problem has ", length(problem_traces[1]), " traces")
-    println("First trace length = ", length(problem_traces[1][1].exec_path))
-
-    exit()
-    problems = Karel_2018.get_all_problems()  # ~10 IOExamples per problem
-    prob = problems[1]  # try one first
-
+    rec = ds.programs[1]
+    prob = Problem("karel-traces", rec.traces)
     # run with your probabilistic bottom-up iterator
-    prog, hits = solve_one(prob, M, G, 10)  # increase 15 if you need a bigger search radius
-    if isnothing(prog)
-        println("No program found. Best coverage: $hits / $(length(prob.spec))")
+    prog, hits = solve_one(prob, M, G, 20)  # increase 15 if you need a bigger search radius
+    total = 0
+    for tr in prob.spec
+        total += length(tr.exec_path) - 1 # -1 to ignore the initial state
+    end
+    if hits < total
+        println("No program found. Best coverage: $hits / $total")
+        println("Program: ", rulenode2expr(prog, G))
     else
-        println("Solved with $hits / $(length(prob.spec))")
+        println("Solved with $hits / $total")
         println("Program: ", rulenode2expr(prog, G))
     end
 end
 
-function count_matches(prog::AbstractRuleNode, prob::Problem, grammar)
-    hits = 0
-    for ex in prob.spec
-        println(ex)
-        println(typeof(ex))
-        exit()
-        # println(typeof(prog))
-        # frozen = HerbConstraints.freeze_state(prog)
-        # println(typeof(frozen), typeof(grammar), typeof(ex))
-        # println(grammar_karel)
-        out = Karel_2018.interpret(prog, grammar_karel, ex, Dict{Int,AbstractRuleNode}())  # Karel interpreter
-        hits += (out == ex.out) ? 1 : 0
+function matches_trace(prog::AbstractRuleNode, grammar, tr::Trace{KarelState})::Int
+    init = deepcopy(tr.exec_path[1])
+    ex   = IOExample(Dict(:_arg_1 => init), nothing)
+
+    _, _, exec_path = KarelUtils.interpret(prog, grammar, ex;
+                                           trace=KarelState[], include_initial=true)
+
+    number_traces = length(tr.exec_path)
+
+    traces_hit = 0 #skip the initial state
+    # We compare the order of the execution_path opf our program with the trace
+    for state in exec_path
+        if traces_hit == number_traces - 1 # -1 because we skip the initial state
+            break
+        end
+        if state == tr.exec_path[traces_hit + 2]  # +2 because we skip the initial state
+            traces_hit += 1
+        end
     end
-    return hits, length(prob.spec)
+    return traces_hit
+end
+
+function count_matches(prog::AbstractRuleNode, prob::Problem{<:AbstractVector{<:Trace}}, grammar)
+    hits = 0
+    total = 0
+    for tr in prob.spec
+        hits += matches_trace(prog, grammar, tr)
+        total += length(tr.exec_path) - 1  # -1 to ignore the initial state
+    end
+    return hits, total
 end
 
 function solve_one(prob::Problem, M, grammar, max_cost::Int)
@@ -410,6 +364,7 @@ function solve_one(prob::Problem, M, grammar, max_cost::Int)
     for (i, prog) in enumerate(it)
         println("Program: ", rulenode2expr(prog, grammar))
         hits, N = count_matches(prog, prob, grammar)
+        println("Has hits: $hits / $N")
         size_now = program_rule_count(prog)
         trigger = false
         if hits > best_hits
@@ -427,11 +382,9 @@ function solve_one(prob::Problem, M, grammar, max_cost::Int)
         if trigger
             update_fit_from_program!(Fit, prog, hits, N)
             probe_update_costs!(it.costMatrix, C0, grammar, Fit)
-
             if hits == N; break; end
         end
     end
-    println("BEST PROG BEFORE RETURN:", best_prog)
     return best_prog, best_hits
 end
 
