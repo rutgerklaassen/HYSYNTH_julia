@@ -4,13 +4,14 @@ include("hysynth.jl")
 include("utils.jl")
 include("depth_based_synthesis.jl")
 
-
 using .ParseKarel
 using .Grammar
 using .Hysynth
 using .Depth_synthesis
 using .Utils
 using HerbSearch, HerbCore, HerbGrammar, HerbSpecification
+using ProfileView
+using StatProfilerHTML
 
 using HerbBenchmarks
 using HerbBenchmarks.Robots_2020
@@ -19,12 +20,11 @@ using HerbBenchmarks.Robots_2020
 llm_response_1 = "move turnleft move move"
 llm_response_2 = "WHILE(markersPresent pickMarker move turnLeft putMarker)"
 llm_response_3 = "WHILE(notAtBottom(), moveDown()); drop()"
-
 # Parse trees array
 parsed_trees = Vector{Union{Nothing, ParseTree}}(undef, 3)
 parsed_trees[1] = parse_llm_response(llm_response_1)
-# parsed_trees[2] = parse_llm_response(llm_response_2)
-# parsed_trees[3] = parse_llm_response(llm_response_3)
+parsed_trees[2] = parse_llm_response(llm_response_2)
+parsed_trees[3] = parse_llm_response(llm_response_3)
 
 
 grammar_robots = @csgrammar begin
@@ -76,7 +76,6 @@ for tree in parsed_trees
 
         # Build and fill the numeric matrix (6 rows; all grammar rules as columns)
         M, rules = Utils.counts_matrix(counts_by_depth, grammar_karel; nrows=6)
-
         # Print the whole matrix
         println("\nMatrix M (size = ", size(M), "):")
         println(M)
@@ -98,7 +97,6 @@ for tree in parsed_trees
         # run_depth_synthesis_tests()
         run_depth_synthesis(C, grammar_karel)
         # run_priority_robot_test(pcsg)
-        exit()
     else
         println("Failed to parse LLM response.")
     end

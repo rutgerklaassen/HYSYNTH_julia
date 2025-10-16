@@ -1,0 +1,74 @@
+You are a program synthesizer. Output ONLY one program in the target DSL that satisfies all examples.
+Do not explain. Do not add comments or extra text. If no solution fits the grammar, output exactly: (no-solution).
+
+# TASK
+Given:
+1) A domain-specific language (DSL) as a context-free grammar (CFG).
+2) A set of input→output examples.
+3) Execution traces / intermediate states that MUST be matched 
+
+Produce ONE program in the DSL that:
+- Is syntactically valid w.r.t. the CFG.
+- When executed, returns the required outputs for ALL examples.
+- follows the same step-by-step behavior for those examples.
+
+# OUTPUT FORMAT (STRICT)
+Return ONLY the program, nothing else.
+- return the complete program block only.
+- Do NOT include backticks or prose.
+
+# MINIMALITY & VALIDITY
+- Prefer the simplest correct program (fewest nodes / constructs) when multiple work.
+- Use ONLY terminals and productions allowed by the provided CFG.
+- Do NOT invent identifiers, predicates, or library calls outside the CFG.
+- Respect arities and types exactly.
+
+
+# DSL (CFG)
+    Start = Block                                   #1
+
+    Block = Action                                  #2
+    Block = (Action; Block)                         #3
+    Block = ControlFlow                             #4
+
+    Action = move                                   #5
+    Action = turnLeft                               #6
+    Action = turnRight                              #7
+    Action = pickMarker                             #8
+    Action = putMarker                              #9
+
+    ControlFlow = IF(Condition, Block)              #10
+    ControlFlow = IFELSE(Condition, Block, Block)   #11
+    ControlFlow = WHILE(Condition, Block)           #12
+    ControlFlow = REPEAT(R=INT, Block)              #13
+    INT = |(1:5)                                    #14-18
+
+    Condition = frontIsClear                        #19
+    Condition = leftIsClear                         #20
+    Condition = rightIsClear                        #21
+    Condition = markersPresent                      #22
+    Condition = noMarkersPresent                    #23
+    Condition = NOT(Condition)                      #24
+
+# WORLD REPRESENTATION
+Each example takes place in a Karel world — a 2D grid surrounded by walls (`#`). 
+- `.` represents an empty cell.
+- `o` represents a cell containing a marker.
+- `^`, `v`, `<`, `>` denote Karel’s position and orientation (north, south, west, east).
+- Walls (`#`) cannot be traversed.
+- Actions like `move`, `turnLeft`, `pickMarker`, and `putMarker` modify the world state.
+The goal is to transform the input world into the output world exactly, matching all intermediate states when provided.
+
+# SPECIFICATION
+# Input→Intermediate→Output states the program MUST satisfy:
+
+{EXAMPLES_BLOCK}
+
+# CONSTRAINTS
+- No I/O; compute only via allowed DSL primitives.
+- Execution must terminate on all provided examples.
+
+# SELF-CHECK BEFORE YOU ANSWER (NO OUTPUT OF THIS THINKING):
+1) Parse your candidate against the CFG.
+2) Simulate it on ALL inputs; confirm intermediate states and outputs match exactly.
+4) If any check fails, revise. Otherwise, output ONLY the final program.
