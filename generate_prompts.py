@@ -6,6 +6,8 @@ import tempfile
 import subprocess
 from pathlib import Path
 from collections import defaultdict
+import hashlib
+from datetime import datetime, timezone
 
 # ----------------------- Embedded Julia dumper -----------------------
 JULIA_DUMPER = r"""
@@ -299,6 +301,13 @@ def main():
         grouped[pid]["program"] = row["program"]
         grouped[pid]["by_world"][row["world"]] = row
 
+    # compute dataset fingerprint (stable ID for joins)
+    try:
+        ds_bytes = dataset_path.read_bytes()
+        dataset_sha8 = hashlib.sha1(ds_bytes).hexdigest()[:8]
+    except Exception:
+        dataset_sha8 = "nosha"
+
     # 3) for each program, order by world index and build a single prompt
     uses_examples_block = "{EXAMPLES_BLOCK}" in template
 
@@ -331,24 +340,32 @@ def main():
 
         # Optionally include the true program/depth in the prompt if your template wants them
         # Example placeholders: {REFERENCE_PROGRAM} and {DEPTH}
-        prompt_text = (
-            prompt_text
-            .replace("{REFERENCE_PROGRAM}", str(prog)) if "{REFERENCE_PROGRAM}" in prompt_text else prompt_text
-        )
-        prompt_text = (
-            prompt_text
-            .replace("{DEPTH}", str(depth)) if "{DEPTH}" in prompt_text else prompt_text
-        )
+        if "{REFERENCE_PROGRAM}" in prompt_text:
+            prompt_text = prompt_text.replace("{REFERENCE_PROGRAM}", str(prog))
+        if "{DEPTH}" in prompt_text:
+            prompt_text = prompt_text.replace("{DEPTH}", str(depth))
+
+        # stable problem_id
+        problem_id = f"karel_by_depth::{dataset_sha8}::p{pid:04d}"
 
         # Write one file per PROGRAM (no world suffix)
         fname = f"{args.prefix}_d{depth}_p{pid:04d}.txt"
         (outdir / fname).write_text(prompt_text, encoding="utf-8")
-        index.append({"file": fname, "pid": pid, "depth": depth})
+
+        index.append({
+            "problem_id": problem_id,
+            "file": fname,
+            "pid": pid,
+            "depth": depth,
+            "dataset_path": str(dataset_path),
+            "world_count": len(worlds),
+            "written_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
         written += 1
         if args.limit and written >= args.limit:
             break
 
-    # 4) write an index for bookkeeping
+    # 4) write an index for bookkeeping (JSONL)
     (outdir / "index.jsonl").write_text(
         "".join(json.dumps(rec) + "\n" for rec in index),
         encoding="utf-8",
