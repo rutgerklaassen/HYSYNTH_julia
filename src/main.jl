@@ -159,47 +159,58 @@ end
 
 # Evaluate a single problem (by pid) with a cost matrix:
 function run_depth_iter_for_problem(ds, pid::Int, G::AbstractGrammar, C::Matrix{Float64};
-                                    max_cost=1e9, max_depth=8, max_size=50, jit_enabled=false)
+                                    max_cost=1e9, max_depth=10, max_size=50, jit_enabled=false)
 
     rec  = ds.programs[pid]
     prob = Problem("karel-traces", rec.traces)
-    println("Starting to find program : ")
-    println(prob)
+    println("\n\n\n\n\n\n\n\n\n\n\nStarting to find program : ")
+    # println(prob)
     it = DepthCostBasedBottomUpIterator(G, :Start, C;
         bank=HerbSearch.CostBank(),
         max_cost=max_cost, max_depth=max_depth, max_size=max_size,
-        jit_enabled=false   
+        jit_enabled=jit_enabled   
     )
     best_hits = 0
     best_size = typemax(Int)
     best_prog = nothing
+    solved = false
 
     st = nothing
     nxt = iterate(it)
     steps = 0
     while nxt !== nothing
         steps += 1
-        println(steps)
         (p, st) = nxt
         hits, total = KarelUtils.count_matches(p, prob, G)
-        sz = program_rule_count(p)
+        strict_ok = KarelUtils.satisfies_problem_strict(p, prob, G)
 
+        sz = program_rule_count(p)
+        if steps % 500 == 0
+            println(steps)
+            println(sz)
+        end
+        if strict_ok
+            println("program ", rulenode2expr(freeze_state(p), G), "(",freeze_state(p),")", " is an exact hit with size ", sz)
+            solved = true
+            return (; steps, best_hits, best_size, best_prog, solved)
+        end
         improved = (hits > best_hits) || (hits == best_hits && sz < best_size)
         if improved
             best_hits = hits; best_size = sz; best_prog = p
-            println("program ", rulenode2expr(freeze_state(p), G), " is a new best hit! ", best_hits , " out of ", total, " with size ", sz)
+            println("program ", rulenode2expr(freeze_state(p), G), "(",freeze_state(p),")", " is a new best hit! ", best_hits , " out of ", total, " with size ", sz)
             apply_probe_update!(it, p, hits, total)
-            if hits == total
-                return (; steps, best_hits, best_size, best_prog)
-            end
+            # if hits == total
+            #     return (; steps, best_hits, best_size, best_prog)
+            # end
         end
         if(steps == 85)
-            @profilehtml nxt = iterate(it, st)
+            # @profilehtml nxt = iterate(it, st)
+            println("Hit 85!")
         else
             nxt = iterate(it, st)
         end
     end
-    return (; steps, best_hits, best_size, best_prog)
+    return (; steps, best_hits, best_size, best_prog, solved)
 end
 
 # =================== Main flow ===================
@@ -224,7 +235,6 @@ function main()
     ds = Serialization.deserialize(dataset_path)
     nprogs = length(ds.programs)
     println("Loaded dataset with $nprogs programs.")
-
     # Load prompt index maps
     by_file, by_pid_map = load_prompt_index(prompts_dir)
 
@@ -238,9 +248,14 @@ function main()
 
     processed = 0
     solved = 0
-
+    first = 0
     # Iterate problems in the dataset
     for (pid, rec) in enumerate(ds.programs)
+        # if first < 3
+        #     println("not doing program : ", first)
+        #     first = first + 1
+        #     continue
+        # end
         # Their problem_id keys look like: karel_by_depth::<sha8>::p0001
         # Find any prompt index entry that has this pid and build problem_id strings.
         # Prompt index JSONL already contains "problem_id" per pid.
@@ -305,14 +320,17 @@ function main()
 
         # Run your new iterator for this problem
         res = run_depth_iter_for_problem(ds, pid, G, C;
-            max_cost=1e9, max_depth=8, max_size=50, jit_enabled=false
+            max_cost=1e9, max_depth=8, max_size=10000, jit_enabled=true
         )
+        println(res.solved)
 
         processed += 1
         @printf("  search steps: %-8d  best_hits: %d  size: %d\n",
                 res.steps, res.best_hits, res.best_size)
-        res.best_hits == length(ds.programs[pid].traces) && (solved += 1)
-
+        if res.solved
+            solved += 1
+        end
+        # exit()
         # Optional: stop after limit for quick sanity checks
         processed >= limit_probs && break
     end

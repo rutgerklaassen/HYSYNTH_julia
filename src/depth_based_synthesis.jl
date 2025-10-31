@@ -24,107 +24,12 @@ export DepthCostBasedBottomUpIterator,
     jit_enabled::Bool=false                                                   # toggle
 ) <: AbstractCostBasedBottomUpIterator
 
-
-# ---------- helper: rule index + children (UniformHole / StateHole) ----------
-_ruleindex(u::UniformHole) = begin
-    j = findfirst(u.domain)
-    @assert j !== nothing "UniformHole has empty/invalid domain"
-    j
+# BOUNDED MAX-HEAP OF BEST PARENTS BY DEPTH-AWARE LB
+struct ParentCand
+    lb::Float64
+    hole::UniformHole
 end
-_children(u::UniformHole) = u.children
-
-_ruleindex(u::HerbConstraints.StateHole) = begin
-    j = findfirst(u.domain)
-    @assert j !== nothing "StateHole has empty/invalid domain"
-    j
-end
-_children(u::HerbConstraints.StateHole) = u.children
-
-# Optional metric you used in the old loop
-function program_rule_count(node::Union{UniformHole,HerbConstraints.StateHole})
-    total = 1
-    @inbounds for c in _children(node)
-        total += program_rule_count(c)
-    end
-    return total
-end
-
-# ---------- lower bound utility (unchanged from your new code) ----------
-function min_entry_lb_at_depth(iter, ent::UniformTreeEntry, d0::Int)
-    D = size(iter.logp_by_depth, 2)
-    lb = 0.0
-    @inbounds for ax in ent.axes
-        d_abs = d0 + length(ax.path)
-        d = d_abs ≤ D ? d_abs : D
-        m = Inf
-        for ridx in ax.options
-            c = iter.logp_by_depth[ridx, d]
-            if c < m; m = c; end
-        end
-        lb += m
-    end
-    return lb
-end
-
-# ---------- horizon ----------
-function calculate_new_horizon(iter::AbstractCostBasedBottomUpIterator)::Float64
-    bank    = get_bank(iter)
-    grammar = get_grammar(iter.solver)
-    limit   = get_measure_limit(iter)
-
-    bytype = Dict{Symbol, Vector{UniformTreeEntry}}()
-    for (_, ent) in bank.uh_index
-        push!(get!(bytype, ent.rtype, UniformTreeEntry[]), ent)
-    end
-
-    terminals = grammar.isterminal
-    nonterm   = .~terminals
-    shapes    = UniformHole.(partition(Hole(nonterm), grammar), ([],))
-
-    best = Inf
-    D = size(iter.logp_by_depth, 2)
-    d_op = 1
-    d_child0 = d_op + 1
-
-    for shape in shapes
-        rule_idx = findfirst(shape.domain)
-        rule_idx === nothing && continue
-        child_types = Tuple(grammar.childtypes[rule_idx])
-
-        candidate_lists = Vector{Vector{UniformTreeEntry}}(undef, length(child_types))
-        feasible = true
-        @inbounds for i in 1:length(child_types)
-            lst = get(bytype, child_types[i], nothing)
-            if lst === nothing || isempty(lst)
-                feasible = false; break
-            end
-            candidate_lists[i] = lst
-        end
-        feasible || continue
-
-        op_min = Inf
-        @inbounds for ridx in findall(shape.domain)
-            d = d_op ≤ D ? d_op : D
-            c = iter.logp_by_depth[ridx, d]
-            if c < op_min; op_min = c; end
-        end
-        isfinite(op_min) || continue
-
-        for tuple_children in Iterators.product(candidate_lists...)
-            any_new = any(e.new_shape for e in tuple_children)
-            any_new || continue
-
-            lb = op_min
-            @inbounds for e in tuple_children
-                lb += min_entry_lb_at_depth(iter, e, d_child0)
-            end
-            if lb < best && lb ≤ limit
-                best = lb
-            end
-        end
-    end
-    return best
-end
+Base.isless(a::ParentCand, b::ParentCand) = a.lb > b.lb
 
 function build_depth_aware_axes(
     iter::DepthCostBasedBottomUpIterator,
@@ -189,194 +94,243 @@ function HerbSearch.add_to_bank!(iter::DepthCostBasedBottomUpIterator, uh::Unifo
     return uh_id
 end
 
-# function populate_bank!(iter::DepthCostBasedBottomUpIterator)
-#     grammar = get_grammar(iter.solver)
-#     bank    = get_bank(iter)
+# ---------- helper: rule index + children (UniformHole / StateHole) ----------
+_ruleindex(u::UniformHole) = begin
+    j = findfirst(u.domain)
+    @assert j !== nothing "UniformHole has empty/invalid domain"
+    j
+end
+_children(u::UniformHole) = u.children
 
-#     new_ids = Int[]
-#     for t in unique(grammar.types)
-#         term_mask = grammar.isterminal .& grammar.domains[t]
-#         if any(term_mask)
-#             uh = UniformHole(term_mask, [])
-#             uh_id = add_to_bank!(iter, uh)
-#             push!(new_ids, uh_id)
-#         end
-#     end
+_ruleindex(u::HerbConstraints.StateHole) = begin
+    j = findfirst(u.domain)
+    @assert j !== nothing "StateHole has empty/invalid domain"
+    j
+end
+_children(u::HerbConstraints.StateHole) = u.children
 
-#     # Incrementally enqueue only the new seed entries
-#     for uh_id in new_ids
-#         enqueue_entry_costs!(iter, uh_id)
-#     end
+# Optional metric you used in the old loop
+function program_rule_count(node::Union{UniformHole,HerbConstraints.StateHole})
+    total = 1
+    @inbounds for c in _children(node)
+        total += program_rule_count(c)
+    end
+    return total
+end
 
-#     # Establish the very first horizon boundary
-#     bank.new_horizon = calculate_new_horizon(iter)
+function HerbSearch.enqueue_entry_costs!(
+    iter::DepthCostBasedBottomUpIterator,
+    uh_id::Int, 
+    n::Int  # how many lowest-cost trees to enqueue
+)
+    bank  = get_bank(iter)
+    ent   = bank.uh_index[uh_id]
+    limit = get_measure_limit(iter)
+    costs = ent.sorted_costs
+
+    # keep indices with cost ≤ limit
+    idxs = [i for (i, c) in pairs(costs) if c ≤ limit]
+    isempty(idxs) && return nothing
+
+    # choose the n smallest by cost
+    if n < length(idxs)
+        perm = partialsortperm(idxs, 1:n; by = i -> costs[i])
+        idxs = idxs[perm]
+    else
+        sort!(idxs; by = i -> costs[i])
+    end
+
+    @inbounds for i in idxs
+        c = costs[i]
+        enqueue!(bank.pq, (uh_id, i), c)
+    end
+    return nothing
+end
+
+function HerbSearch.populate_bank!(iter::DepthCostBasedBottomUpIterator)
+    grammar = get_grammar(iter.solver)
+    bank    = get_bank(iter)
+
+    new_ids = Int[]
+    for t in unique(grammar.types)
+        term_mask = grammar.isterminal .& grammar.domains[t]
+        if any(term_mask)
+            uh = UniformHole(term_mask, [])
+            uh_id = add_to_bank!(iter, uh)
+            push!(new_ids, uh_id)
+        end
+    end
+
+    # Incrementally enqueue only the new seed entries
+    for uh_id in new_ids
+        enqueue_entry_costs!(iter, uh_id)
+    end
+
+    # Collect all addresses within the initial window [last_horizon, new_horizon)
+    out   = CostAccessAddress[]
+    limit = get_measure_limit(iter)
+    for (key, cost) in bank.pq
+        (uh_id, _idx) = key
+        ent  = bank.uh_index[uh_id]
+        idxs = indices_at_cost(iter, ent, cost)
+        @inbounds for i in 1:length(idxs)
+            push!(out, CostAccessAddress(uh_id, cost, i))
+        end
+    end
+    sort!(out; by = a -> a.cost)
+    return out
+end
+
+@inline _Dcols(iter)::Int = size(iter.logp_by_depth, 2)
+
+# Min atom cost over a domain at depth d (clamped to last column if d > D)
+function _min_domain_cost_at_depth(iter::DepthCostBasedBottomUpIterator,
+                                   domain::BitVector,
+                                   d::Int)
+    dclamp = min(d, _Dcols(iter))
+    idxs = findall(domain)
+    @inbounds return minimum(iter.logp_by_depth[i, dclamp] for i in idxs)
+end
+
+# Depth-aware lower bound for a UniformHole (operators at depth d, children at d+1)
+function _lb_uniformhole!(iter::DepthCostBasedBottomUpIterator,
+                          grammar::AbstractGrammar,
+                          node::UniformHole,
+                          d::Int)::Float64
+    if isempty(node.children)
+        term_mask = grammar.isterminal .& node.domain
+        return any(term_mask) ?
+            _min_domain_cost_at_depth(iter, term_mask, d) :
+            _min_domain_cost_at_depth(iter, node.domain, d)
+    else
+        op_mask = (.~grammar.isterminal) .& node.domain
+        op_cost = any(op_mask) ?
+            _min_domain_cost_at_depth(iter, op_mask, d) :
+            _min_domain_cost_at_depth(iter, node.domain, d)
+        @inbounds for ch in node.children
+            op_cost += _lb_uniformhole!(iter, grammar, ch, d+1)
+        end
+        return op_cost
+    end
+end
+
+_lb_uniformhole(iter::DepthCostBasedBottomUpIterator,
+                grammar::AbstractGrammar,
+                hole::UniformHole)::Float64 = _lb_uniformhole!(iter, grammar, hole, 1)
+
+function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
+    bank       = get_bank(iter)
+    grammar    = get_grammar(iter.solver)
+    size_limit  = get_max_size(iter)
+    depth_limit = get_max_depth(iter)
+
+    ######DEBUGGING######
+    println("UH INDEX : ", length(bank.uh_index))
+    count_uh_programs(bank) = begin
+        total = 0
+        for ent in values(bank.uh_index)
+            total += isempty(ent.axes) ? 0 : prod(length(ax.options) for ax in ent.axes)
+        end
+        println("Total programs in UH-index: ", total); total
+    end
+    count_uh_programs(bank)
+    ######################
+
     
-#     # Collect all addresses within the initial window [last_horizon, new_horizon)
-#     out   = CostAccessAddress[]
-#     limit = get_measure_limit(iter)
-#     styp = get_starting_symbol(iter.solver)
+    # tune or promote to a field later
+    top_n = 30
 
-#     for (key, cost) in bank.pq
-#         if cost ≥ bank.last_horizon && cost < bank.new_horizon && cost ≤ limit
-#             (uh_id, _idx) = key
-#             ent  = bank.uh_index[uh_id]
-#             ent.rtype == styp || continue
+    newly_flagged_ids = Set{Int}()
+    for (id, ent) in bank.uh_index
+        ent.new_shape && push!(newly_flagged_ids, id)
+    end
 
-#             idxs = indices_at_cost(iter, ent, cost)
-#             @inbounds for i in 1:length(idxs)
-#                 push!(out, CostAccessAddress(uh_id, cost, i))
-#             end
-#         end
-#     end
-#     sort!(out; by = a -> a.cost)
-#     return out
-# end
+    bytype = Dict{Symbol, Vector{Tuple{Int,UniformTreeEntry}}}()
+    for (id, ent) in bank.uh_index
+        push!(get!(bytype, ent.rtype, Tuple{Int,UniformTreeEntry}[]), (id, ent))
+    end
 
-# function combine(iter::DepthCostBasedBottomUpIterator, state)
-#     bank    = get_bank(iter)
-#     grammar = get_grammar(iter.solver)
-
-#     size_limit = get_max_size(iter)
-#     depth_limit = get_max_depth(iter)
-
-#     newly_flagged_ids = Set{Int}()
-#     for (id, ent) in bank.uh_index
-#         if ent.new_shape
-#             push!(newly_flagged_ids, id)
-#         end
-#     end
-
-#     bytype = Dict{Symbol, Vector{Tuple{Int,UniformTreeEntry}}}()
-#     for (id, ent) in bank.uh_index
-#         push!(get!(bytype, ent.rtype, Tuple{Int,UniformTreeEntry}[]), (id, ent))
-#     end
-
-#     terminals = grammar.isterminal
-#     nonterm   = .~terminals
-#     shapes    = UniformHole.(partition(Hole(nonterm), grammar), ([],))
-
-#     added_ids = Int[]
-
-#     for shape in shapes
-#         rule_idx = findfirst(shape.domain)
-#         rule_idx === nothing && continue
-#         child_types = Tuple(grammar.childtypes[rule_idx])
-
-#         candidates = Vector{Vector{Tuple{Int,UniformTreeEntry}}}(undef, length(child_types))
-#         feasible = true
-#         @inbounds for i in 1:length(child_types)
-#             lst = get(bytype, child_types[i], nothing)
-#             if lst === nothing || isempty(lst)
-#                 feasible = false; break
-#             end
-#             candidates[i] = lst
-#         end
-#         feasible || continue
-
-#         for tuple_children in Iterators.product(candidates...)
-#             any_new = any( (id ∈ newly_flagged_ids) for (id, _e) in tuple_children )
-#             any_new || continue # At least one newly found shape must be present
-#             parent_hole = UniformHole(shape.domain, UniformHole[e.hole for (_id, e) in tuple_children])
-#             if length(parent_hole) > size_limit || 
-#                depth(parent_hole) > depth_limit 
-#                 continue
-#             end
-#             uh_id = add_to_bank!(iter, parent_hole) 
-#             push!(added_ids, uh_id)
-#         end
-#     end
-
-#     for id in newly_flagged_ids
-#         bank.uh_index[id].new_shape = false
-#     end
-
-#     for uh_id in added_ids
-#         enqueue_entry_costs!(iter, uh_id)
-#     end
-
-#     bank.last_horizon = bank.new_horizon
-#     bank.new_horizon  = calculate_new_horizon(iter)
-
-#     out   = CostAccessAddress[]
-#     limit = get_measure_limit(iter)
-#     styp = get_starting_symbol(iter.solver)
-
-#     for (key, cost) in bank.pq
-#         if cost ≥ bank.last_horizon && cost < bank.new_horizon && cost ≤ limit
-#             (uh_id, _idx_in_sorted) = key
-#             ent  = bank.uh_index[uh_id]
-#             ent.rtype == styp || continue
-#             idxs = indices_at_cost(iter, ent, cost)
-#             @inbounds for i in 1:length(idxs)
-#                 push!(out, CostAccessAddress(uh_id, cost, i))
-#             end
-#         end
-#     end
-
-#     sort!(out; by = a -> a.cost)
-#     return out, state
-# end
-# --- Add this helper once ---
-# get_starting_symbol
-# _start_type(iter) = HerbGrammar.return_type(get_grammar(iter.solver), get_tree(get_solver(iter)))
-
-# --- Replace your Base.iterate(iter, state) with this filtered version ---
-# function Base.iterate(iter::AbstractCostBasedBottomUpIterator, state::GenericBUState)
-#     # We already filter to styp inside populate_bank!/combine, so no need to
-#     # re-check the type here.
-#     while true
-#         if isempty(state.combinations)
-#             # keep pushing horizon until we get some Start addrs, or no progress
-#             while true
-#                 addrs, _ = combine(iter, state)
-#                 if !isempty(addrs)
-#                     state.combinations = addrs
-#                     break
-#                 end
-#                 # no addrs this slice; check if we can still progress
-#                 bank = get_bank(iter)
-#                 # combine() has just updated last_horizon/new_horizon
-#                 if bank.new_horizon == bank.last_horizon || !isfinite(bank.new_horizon)
-#                     return nothing  # exhausted
-#                 end
-#                 # otherwise loop again to advance to the next window
-#             end
-#         end
-
-#         # pop next address and reconstruct the concrete program
-#         addr = popfirst!(state.combinations)
-#         prog = retrieve(iter, addr)
-#         if prog === nothing
-#             continue  # skip infeasible reconstructions
-#         end
-#         return prog, state  # already Start-typed by construction
-#     end
-# end
+    terminals = grammar.isterminal
+    nonterm   = .~terminals
+    shapes    = UniformHole.(partition(Hole(nonterm), grammar), ([],))
 
 
-# function HerbSearch.iterate(iter::DepthCostBasedBottomUpIterator)
-#     grammar = get_grammar(iter.solver)
-#     # Check whether all probabilities are negative, or all costs are positive.
-#     # @assert all(p <= 0 for p in iter.logp_by_depth) ||
-#     #      all(c > 0 for c in iter.logp_by_depth)
-    
-#     addrs = populate_bank!(iter)
-#     solver = get_solver(iter)
-#     start  = get_tree(solver)
-#     st = GenericBUState(addrs, nothing, nothing, start)
-#     return Base.iterate(iter, st)
-# end
+    heap = BinaryMaxHeap{ParentCand}()
 
+    for shape in shapes
+        rule_idx = findfirst(shape.domain)
+        rule_idx === nothing && continue
+        child_types = Tuple(grammar.childtypes[rule_idx])
 
-# ================================================================
-#         PROBE-style JIT learning (ported & adapted)
-# ================================================================
+        candidates = Vector{Vector{Tuple{Int,UniformTreeEntry}}}(undef, length(child_types))
+        feasible = true
+        @inbounds for i in 1:length(child_types)
+            lst = get(bytype, child_types[i], nothing)
+            if lst === nothing || isempty(lst)
+                feasible = false; break
+            end
+            candidates[i] = lst
+        end
+        feasible || continue
+
+        for tuple_children in Iterators.product(candidates...)
+            any_new = any( (id ∈ newly_flagged_ids) for (id, _e) in tuple_children )
+            any_new || continue
+
+            parent_hole = UniformHole(
+                shape.domain,
+                UniformHole[e.hole for (_id, e) in tuple_children]
+            )
+            
+            if length(parent_hole) > size_limit || program_rule_count(parent_hole) > depth_limit
+                continue
+            end
+
+            lb = _lb_uniformhole(iter, grammar, parent_hole)  # depth-aware from logp_by_depth
+            push!(heap, ParentCand(lb, parent_hole))
+            if length(heap) > top_n
+                pop!(heap)  # evict worst (highest) lb
+            end
+        end
+    end
+
+    # clear flags
+    for id in newly_flagged_ids
+        bank.uh_index[id].new_shape = false
+    end
+
+    # materialize only the kept parents
+    added_ids = Int[]
+    while !isempty(heap)
+        cand = pop!(heap)
+        uh_id = add_to_bank!(iter, cand.hole)
+        push!(added_ids, uh_id)
+    end
+
+    for uh_id in added_ids
+        enqueue_entry_costs!(iter, uh_id)
+    end
+       
+    out = CostAccessAddress[]
+    for uh_id in added_ids
+        ent  = bank.uh_index[uh_id]
+        for (i, c) in pairs(ent.sorted_costs)
+            c ≤ get_measure_limit(iter) || continue
+            idxs = indices_at_cost(iter, ent, c)
+            @inbounds for k in 1:length(idxs)
+                push!(out, CostAccessAddress(uh_id, c, k))
+            end
+        end
+    end
+    sort!(out; by = a -> a.cost)
+    return out, state
+end
 
 # Update FIT along the program's tree using coverage cov = hits/N
 function update_fit_from_program!(
     fit::AbstractMatrix{Float64},
     prog::Union{UniformHole,HerbConstraints.StateHole},
-    hits::Int, N::Int; depth::Int=1
+    hits::Int, N::Int, depth::Int=1
 )
     cov = (N == 0) ? 0.0 : clamp(hits / N, 0.0, 1.0)
     _upd_fit!(fit, prog, cov, depth)
@@ -411,7 +365,6 @@ function probe_update_costs!(
 )
     @assert size(dest_costs) == size(base_costs) == size(fit)
     R, D = size(base_costs)
-    println("R : ", R, " D : ", D)
     types = grammar.types
     # group rule indices by LHS type once
     by_type = Dict{Symbol, Vector{Int}}()
@@ -449,13 +402,21 @@ function apply_probe_update!(
     prog::Union{UniformHole,HerbConstraints.StateHole},
     hits::Int, total::Int
 )
+    depth = 1
     iter.jit_enabled || return false
     println(freeze_state(prog))
     rt = HerbGrammar.return_type(get_grammar(iter.solver), freeze_state(prog))
-    @assert rt == :Start "apply_probe_update! needs a :Start-rooted program for depth-accurate updates (got $rt)"
-
+    @assert rt == :Start || rt == :ControlFlow || rt == :Block || rt == :Action "apply_probe_update! needs a :Start-rooted program for depth-accurate updates (got $rt)"
+    
+    if rt == :ControlFlow
+        depth = depth + 2
+    elseif  rt == :Block
+        depth = depth + 1
+    elseif rt == :Action
+        depth = depth + 2
+    end
     # 1) update FIT on the path of this program
-    update_fit_from_program!(iter.fit, prog, hits, total)
+    update_fit_from_program!(iter.fit, prog, hits, total, depth)
     # 2) recompute current costs from base costs + FIT
     probe_update_costs!(iter.logp_by_depth, iter.base_logp_by_depth, get_grammar(iter.solver), iter.fit)
     return true
