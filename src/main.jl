@@ -67,18 +67,19 @@ function load_prompt_index(prompts_dir::AbstractString)
     if !isfile(idx_path)
         error("Missing prompts index: $(idx_path). Generate prompts first.")
     end
-    # Return two maps:
-    #  - by_file[filename] -> record
-    #  - by_problem_id[problem_id] -> record
     by_file = Dict{String, Any}()
     by_pid  = Dict{String, Any}()
+    by_hash = Dict{String, Any}()
     for rec in read_jsonl(idx_path)
         file = String(rec["file"])
         pid  = String(rec["problem_id"])
         by_file[file] = rec
         by_pid[pid]   = rec
+        if haskey(rec, "problem_hash")
+            by_hash[String(rec["problem_hash"])] = rec
+        end
     end
-    return by_file, by_pid
+    return by_file, by_pid, by_hash
 end
 
 function collect_run_rows(runs_dir::AbstractString; model_filter::String="")
@@ -185,10 +186,10 @@ function run_depth_iter_for_problem(ds, pid::Int, G::AbstractGrammar, C::Matrix{
         strict_ok = KarelUtils.satisfies_problem_strict(p, prob, G)
 
         sz = program_rule_count(p)
-        if steps % 500 == 0
-            println(steps)
-            println(sz)
-        end
+        # if steps % 500 == 0
+        #     println(steps)
+        #     println(sz)
+        # end
         if strict_ok
             println("program ", rulenode2expr(freeze_state(p), G), "(",freeze_state(p),")", " is an exact hit with size ", sz)
             solved = true
@@ -203,14 +204,24 @@ function run_depth_iter_for_problem(ds, pid::Int, G::AbstractGrammar, C::Matrix{
             #     return (; steps, best_hits, best_size, best_prog)
             # end
         end
-        if(steps == 85)
-            # @profilehtml nxt = iterate(it, st)
-            println("Hit 85!")
-        else
-            nxt = iterate(it, st)
-        end
+        nxt = iterate(it, st)
     end
     return (; steps, best_hits, best_size, best_prog, solved)
+end
+
+# Build: problem_hash -> Vector{String} (answer paths)
+function map_answers_by_hash(run_rows::Vector{Any}; base::AbstractString=".")
+    mp = Dict{String, Vector{String}}()
+    for r in run_rows
+        if !haskey(r, "problem_hash") || r["problem_hash"] === nothing
+            continue
+        end
+        ph = String(r["problem_hash"])
+        ans_rel = String(r["answer_path"])
+        ans_abs = isabspath(ans_rel) ? ans_rel : normpath(joinpath(base, ans_rel))
+        push!(get!(mp, ph, String[]), ans_abs)
+    end
+    return mp
 end
 
 # =================== Main flow ===================
@@ -236,12 +247,12 @@ function main()
     nprogs = length(ds.programs)
     println("Loaded dataset with $nprogs programs.")
     # Load prompt index maps
-    by_file, by_pid_map = load_prompt_index(prompts_dir)
+    by_file, by_pid_map, by_hash = load_prompt_index(prompts_dir)
 
     # Collect all run rows (optionally filtered by model) and map to problem_id -> answers
     run_rows = collect_run_rows(runs_dir; model_filter=model_filter)
     manifest_base = realpath(joinpath(prompts_dir, ".."))  # project root: parent of prompts/
-    answers_by_problem = map_answers_by_problem(run_rows; base=manifest_base)
+    answers_by_hash = map_answers_by_hash(run_rows; base=manifest_base)
 
     # Grammar to use everywhere
     G = KarelUtils.grammar_karel
@@ -251,11 +262,6 @@ function main()
     first = 0
     # Iterate problems in the dataset
     for (pid, rec) in enumerate(ds.programs)
-        # if first < 3
-        #     println("not doing program : ", first)
-        #     first = first + 1
-        #     continue
-        # end
         # Their problem_id keys look like: karel_by_depth::<sha8>::p0001
         # Find any prompt index entry that has this pid and build problem_id strings.
         # Prompt index JSONL already contains "problem_id" per pid.
@@ -272,10 +278,16 @@ function main()
             end
         end
         idx_rec === nothing && continue
-
+        problem_hash = haskey(idx_rec, "problem_hash") ? String(idx_rec["problem_hash"]) : ""
+        if isempty(problem_hash)
+            @info "No problem_hash in index; skipping for safety" pid
+            continue
+        end
+        ans_paths = get(answers_by_hash, problem_hash, String[])
+        print(ans_paths)
         problem_id = String(idx_rec["problem_id"])
         depth      = Int(idx_rec["depth"])
-        ans_paths  = get(answers_by_problem, problem_id, String[])
+        # ans_paths  = get(answers_by_problem, problem_id, String[])
 
         if isempty(ans_paths)
             @info "No answers for problem" pid problem_id depth
@@ -291,7 +303,16 @@ function main()
             if isfile(ap)
                 txt = read(ap, String)
                 t = try_parse_answer(txt)
-                t !== nothing && push!(trees, t)
+                if t === nothing
+                    baddir = joinpath(runs_dir, "bad_answers")
+                    isdir(baddir) || mkpath(baddir)
+                    outname = @sprintf("pid_%04d_sample_%04d.txt", pid, taken)
+                    open(joinpath(baddir, outname), "w") do io
+                        write(io, txt)
+                    end
+                else
+                    push!(trees, t)
+                end
             else
                 @warn "Answer file missing" ap
             end
@@ -334,7 +355,7 @@ function main()
         # Optional: stop after limit for quick sanity checks
         processed >= limit_probs && break
     end
-
+    print(length(all_answers))
     println("\n=== Summary ===")
     println("Processed problems : ", processed)
     println("Fully solved       : ", solved)

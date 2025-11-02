@@ -16,7 +16,7 @@ get_warnings() = _WARNINGS[]  # read-only snapshot
 # ---------- Grammar vocab (canonical forms) ----------
 const ACTIONS    = Set(["move","turnLeft","turnRight","pickMarker","putMarker"])
 const COND_ATOMS = Set(["frontIsClear","leftIsClear","rightIsClear","markersPresent","noMarkersPresent"])
-const CTRL_KEYS  = ["IF","IFELSE","WHILE","REPEAT","NOT"]  # order matters (IFELSE before IF)
+const CTRL_KEYS  = ["IFELSE","IF","WHILE","REPEAT","NOT"]  # order matters (IFELSE before IF)
 const CTRL_SET   = Set(CTRL_KEYS)
 
 # ---------- Case-insensitive helpers / maps ----------
@@ -245,6 +245,14 @@ function parse_controlflow_node(seg::AbstractString)
             bl = parse_block_string(parts[2])
             if c !== nothing && bl !== nothing
                 return ParseTree("ControlFlow->IF(Condition, Block)", [c, bl])
+            end
+        elseif length(parts) == 3
+            # --- tolerate 3-arg IF by treating it as IFELSE ---
+            c  = parse_condition(parts[1])
+            b1 = parse_block_string(parts[2])
+            b2 = parse_block_string(parts[3])
+            if c !== nothing && b1 !== nothing && b2 !== nothing
+                return ParseTree("ControlFlow->IFELSE(Condition, Block, Block)", [c, b1, b2])
             end
         end
         return nothing
