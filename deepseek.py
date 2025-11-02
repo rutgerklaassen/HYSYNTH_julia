@@ -9,7 +9,9 @@ from typing import Iterable
 from openai import OpenAI
 
 # --- Config ---
-os.environ["OPENAI_API_KEY"] = "sk-033817b3cec945c9bdb34505d6681670"  # or set in shell
+with open('api_keys.json') as f:
+    api_json = json.load(f)
+os.environ["OPENAI_API_KEY"] = api_json["DEEPSEEK_API"]  # or set in shell
 MODEL = "deepseek-chat"
 BASE_URL = "https://api.deepseek.com"
 API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -50,6 +52,15 @@ def infer_problem_id(prompt_file: Path, index_map: dict) -> str:
         return rec["problem_id"]
     # fallback if index missing (keeps working but less ideal)
     return f"unknown::{prompt_file.name}"
+def infer_problem_hash(prompt_file: Path, index_map: dict):
+    """
+    Pull a per-problem hash (computed in generate_prompts.py) from prompts/index.jsonl.
+    Returns None if not present (so older indices won't crash).
+    """
+    rec = index_map.get(prompt_file.name)
+    if rec:
+        return rec.get("problem_hash")
+    return None
 
 def main():
     if not PROMPTS_DIR.is_dir():
@@ -102,6 +113,7 @@ def main():
             start_idx = max_idx + 1
 
             problem_id = infer_problem_id(prompt_file, index_map)
+            problem_hash = infer_problem_hash(prompt_file, index_map)
 
             for k in range(start_idx, start_idx + N_SAMPLES):
                 out_file = out_parent / f"{stem}_answer_{k:04d}.txt"
@@ -121,6 +133,7 @@ def main():
                 # One manifest row per sample
                 row = {
                     "problem_id": problem_id,
+                    "problem_hash": problem_hash,  # <-- NEW
                     "prompt_path": os.path.relpath(abs_prompt, start=SCRIPT_DIR),
                     "answer_path": os.path.relpath(out_file.resolve(), start=SCRIPT_DIR),
                     "model": MODEL,

@@ -8,6 +8,8 @@ from pathlib import Path
 from collections import defaultdict
 import hashlib
 from datetime import datetime, timezone
+import hashlib
+import json
 
 # ----------------------- Embedded Julia dumper -----------------------
 JULIA_DUMPER = r"""
@@ -266,6 +268,44 @@ def build_legacy_blocks(inputs, all_inters, outputs, strip_borders: bool) -> tup
     )
     return inputs_block, inters_block, outputs_block
 
+def _to_plain(obj):
+    """Recursively convert obj into plain JSON-serializable types, deterministically."""
+    # dict
+    if isinstance(obj, dict):
+        # sort keys to make deterministic
+        return {k: _to_plain(obj[k]) for k in sorted(obj.keys())}
+    # list/tuple
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain(x) for x in obj]
+    # numpy arrays / tensors
+    if hasattr(obj, "tolist"):
+        try:
+            return obj.tolist()
+        except Exception:
+            pass
+    # dataclass / custom object
+    if hasattr(obj, "__dict__"):
+        return _to_plain(vars(obj))
+    # primitives
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    # final fallback (stable textual form)
+    return repr(obj)
+
+def compute_problem_hash(program_str, worlds5):
+    """
+    Hash the *program* and the 5 *worlds* only.
+    The serialization is canonical (sorted keys, no whitespace differences).
+    """
+    payload = {
+        "program": (program_str or "").strip(),
+        "worlds": [_to_plain(w) for w in worlds5],  # exactly 5
+    }
+    s = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    # short but collision-resistant enough for filenames and joins
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+
+
 # ---------- Main ----------
 def main():
     ap = argparse.ArgumentParser(
@@ -347,9 +387,18 @@ def main():
 
         # stable problem_id
         problem_id = f"karel_by_depth::{dataset_sha8}::p{pid:04d}"
+        worlds_states_only = [
+            {
+                "input_state":  w["input_state"],
+                "intermediate_states": w["intermediate_states"],
+                "output_state": w["output_state"],
+            }
+            for w in worlds
+        ]
+        problem_hash = compute_problem_hash(prog, worlds_states_only)  
 
         # Write one file per PROGRAM (no world suffix)
-        fname = f"{args.prefix}_d{depth}_p{pid:04d}.txt"
+        fname = f"{args.prefix}_{problem_hash}_d{depth}_p{pid:04d}.txt"
         (outdir / fname).write_text(prompt_text, encoding="utf-8")
 
         index.append({
@@ -360,6 +409,7 @@ def main():
             "dataset_path": str(dataset_path),
             "world_count": len(worlds),
             "written_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "problem_hash": problem_hash,
         })
         written += 1
         if args.limit and written >= args.limit:

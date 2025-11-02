@@ -1,62 +1,59 @@
-#!/usr/bin/env python3
-import json, re
 from pathlib import Path
+import json
+from glob import glob
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
-ANSWERS_DIR = SCRIPT_DIR / "answers"
-OUT_JSONL   = SCRIPT_DIR / "prompt_answer_manifest.jsonl"
+RUNS_DIR = SCRIPT_DIR / "runs"
 
-def stem_id(path: Path) -> str:
-    """
-    A stable ID from filename. Examples:
-      karel_d7_p0001.txt      -> karel_d7_p0001
-      p0001.txt               -> p0001
-    """
-    return path.stem
+def load_prompt_index():
+    idx_path = PROMPTS_DIR / "index.jsonl"
+    by_fname = {}
+    by_hash = {}
+    with open(idx_path, "r", encoding="utf-8") as f:
+        for ln in f:
+            rec = json.loads(ln)
+            fname = rec.get("file") or rec.get("fname")  # your field name in index
+            phash = rec.get("problem_hash")
+            if fname:
+                by_fname[fname] = rec
+            if phash:
+                by_hash[phash] = rec
+    return by_fname, by_hash
 
-def guess_problem_index(stem: str):
-    """
-    Optional: extract numeric index like p0001 -> 1 (helps align with your dataset order).
-    Returns int or None if not found.
-    """
-    m = re.search(r'[pP](\d{1,6})', stem)
-    return int(m.group(1)) if m else None
+def load_answers_by_hash():
+    answers_for = {}
+    for run_path in glob(str(RUNS_DIR / "run_*.jsonl")):
+        with open(run_path, "r", encoding="utf-8") as f:
+            for ln in f:
+                rec = json.loads(ln)
+                phash = rec.get("problem_hash")
+                if not phash:
+                    continue
+                answers_for.setdefault(phash, []).append(rec["answer_path"])
+    return answers_for
 
-def main():
-    if not PROMPTS_DIR.is_dir():
-        raise SystemExit(f"Prompts folder not found: {PROMPTS_DIR}")
-    OUT_JSONL.unlink(missing_ok=True)
+def build_pairs():
+    by_fname, by_hash = load_prompt_index()
+    answers_for = load_answers_by_hash()
 
-    files = sorted(PROMPTS_DIR.rglob("*.txt"))
-    total = 0
-    paired = 0
-    missing = 0
-
-    with OUT_JSONL.open("w", encoding="utf-8") as out:
-        for p in files:
-            if p.stem.endswith("_answer"):  # skip accidental answers in prompts
-                continue
-            total += 1
-            rel = p.relative_to(PROMPTS_DIR)
-            ans = (ANSWERS_DIR / rel.parent / f"{p.stem}_answer.txt")
-            has_answer = ans.is_file()
-
-            entry = {
-                "id": stem_id(p),
-                "problem_index": guess_problem_index(p.stem),  # optional, may be null
-                "prompt_path": str(p),
-                "answer_path": str(ans) if has_answer else None,
-                "has_answer": has_answer,
-            }
-            out.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            paired += int(has_answer)
-            missing += int(not has_answer)
-
-    print(f"Manifest: {OUT_JSONL.name}")
-    print(f"Prompts found: {total}")
-    print(f"Answers paired: {paired}")
-    print(f"Missing answers: {missing}")
+    pairs = []  # [{prompt_path, problem_hash, answer_paths: [...]}, ...]
+    for prompt_path in sorted((PROMPTS_DIR).glob("**/*.txt")):
+        fname = prompt_path.name
+        idx = by_fname.get(fname)
+        if not idx:
+            continue
+        phash = idx.get("problem_hash")
+        answers = answers_for.get(phash, [])
+        pairs.append({
+            "prompt_path": str(prompt_path),
+            "problem_hash": phash,
+            "answer_paths": answers,
+        })
+    return pairs
 
 if __name__ == "__main__":
-    main()
+    pairs = build_pairs()
+    # print / write as needed
+    for row in pairs:
+        print(row["problem_hash"], len(row["answer_paths"]), row["prompt_path"])
