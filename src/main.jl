@@ -22,6 +22,7 @@ using JSON
 using Printf
 using Dates
 using StatProfilerHTML
+using DataStructures
 
 # =================== CLI Args ===================
 function parse_args()
@@ -156,6 +157,36 @@ function accumulate_counts_matrix(trees::Vector; G::AbstractGrammar, nrows::Int)
     return M_sum, rules_ref, valid
 end
 
+const FNV_OFFSET64 = 0xcbf29ce484222325 % UInt64
+const FNV_PRIME64  = 0x00000100000001B3 % UInt64
+
+function _canon(expr::AbstractString)
+    # collapse whitespace & trim; tweak if you want stricter/looser canon
+    return replace(strip(expr), r"\s+" => " ")
+end
+
+function prog_fingerprint(expr::AbstractString)::UInt64
+    h = FNV_OFFSET64
+    ce = _canon(expr)
+    @inbounds for b in codeunits(ce)
+        h ⊻= UInt64(b)
+        h *= FNV_PRIME64
+    end
+    return h
+end
+
+# returns (frozen_node_or_nothing, ok::Bool)
+safe_freeze(p) = try
+    (freeze_state(p), true)
+catch e
+    if e isa AssertionError
+        (nothing, false)   # <- ALWAYS a 2-tuple
+    else
+        rethrow()
+    end
+end
+
+ prog_fingerprint(x)::UInt64 = prog_fingerprint(repr(x))
 # =================== Synthesis runner (your new iterator) ===================
 
 # Evaluate a single problem (by pid) with a cost matrix:
@@ -164,7 +195,6 @@ function run_depth_iter_for_problem(ds, pid::Int, G::AbstractGrammar, C::Matrix{
 
     rec  = ds.programs[pid]
     prob = Problem("karel-traces", rec.traces)
-    println("\n\n\n\n\n\n\n\n\n\n\nStarting to find program : ")
     # println(prob)
     it = DepthCostBasedBottomUpIterator(G, :Start, C;
         bank=HerbSearch.CostBank(),
@@ -173,17 +203,41 @@ function run_depth_iter_for_problem(ds, pid::Int, G::AbstractGrammar, C::Matrix{
     )
     best_hits = 0
     best_size = typemax(Int)
+    best_extra = 0
     best_prog = nothing
     solved = false
-
+    reset_variables = Depth_synthesis.get_reset_variables(it)
     st = nothing
     nxt = iterate(it)
     steps = 0
+    seen = Set{UInt64}()   # note the parentheses!
+    saw = 0
     while nxt !== nothing
-        steps += 1
         (p, st) = nxt
-        hits, total = KarelUtils.count_matches(p, prob, G)
-        strict_ok = KarelUtils.satisfies_problem_strict(p, prob, G)
+        fpnode, ok = safe_freeze(p)
+        if !ok
+            nxt = iterate(it, st)
+            continue
+        end
+        steps += 1
+
+        if steps % 1000 == 0
+            println(steps)
+        end
+        expr = rulenode2expr(fpnode, G)
+        fp   = prog_fingerprint(expr)
+        if fp ∈ seen
+            saw += 1
+            nxt = iterate(it, st)   # <-- advance the iterator!
+            continue # Already saw this program
+        else
+            push!(seen, fp)
+        end
+
+        
+
+        hits, total, extra = KarelUtils.count_matches(fpnode, prob, G)
+        strict_ok = KarelUtils.satisfies_problem_strict(fpnode, prob, G)
 
         sz = program_rule_count(p)
         # if steps % 500 == 0
@@ -191,15 +245,16 @@ function run_depth_iter_for_problem(ds, pid::Int, G::AbstractGrammar, C::Matrix{
         #     println(sz)
         # end
         if strict_ok
-            println("program ", rulenode2expr(freeze_state(p), G), "(",freeze_state(p),")", " is an exact hit with size ", sz)
+            println("program ", rulenode2expr(fpnode, G), "(",fpnode,")", " is an exact hit with size ", sz)
             solved = true
             return (; steps, best_hits, best_size, best_prog, solved)
         end
-        improved = (hits > best_hits) || (hits == best_hits && sz < best_size)
+        improved = (hits > best_hits) || (hits == best_hits && extra < best_extra) || (hits == best_hits && extra == best_extra && sz < best_size)
         if improved
-            best_hits = hits; best_size = sz; best_prog = p
-            println("program ", rulenode2expr(freeze_state(p), G), "(",freeze_state(p),")", " is a new best hit! ", best_hits , " out of ", total, " with size ", sz)
+            best_hits = hits; best_size = sz; best_prog = p; best_extra = extra;
+            println("program ", rulenode2expr(freeze_state(p), G), "(",fpnode,")", " is a new best hit! ", best_hits , " out of ", total, " with ",extra," extra steps ", " and size ", sz, " and depth ", Depth_synthesis.tree_depth(p))
             apply_probe_update!(it, p, hits, total)
+            reset_variables.depth_exhausted = true
             # if hits == total
             #     return (; steps, best_hits, best_size, best_prog)
             # end
@@ -260,6 +315,7 @@ function main()
     processed = 0
     solved = 0
     first = 0
+
     # Iterate problems in the dataset
     for (pid, rec) in enumerate(ds.programs)
         # Their problem_id keys look like: karel_by_depth::<sha8>::p0001
@@ -284,7 +340,6 @@ function main()
             continue
         end
         ans_paths = get(answers_by_hash, problem_hash, String[])
-        print(ans_paths)
         problem_id = String(idx_rec["problem_id"])
         depth      = Int(idx_rec["depth"])
         # ans_paths  = get(answers_by_problem, problem_id, String[])
@@ -343,19 +398,16 @@ function main()
         res = run_depth_iter_for_problem(ds, pid, G, C;
             max_cost=1e9, max_depth=8, max_size=10000, jit_enabled=true
         )
-        println(res.solved)
-
+        println("SOLVED : ", res.solved)
         processed += 1
         @printf("  search steps: %-8d  best_hits: %d  size: %d\n",
                 res.steps, res.best_hits, res.best_size)
         if res.solved
             solved += 1
         end
-        # exit()
         # Optional: stop after limit for quick sanity checks
         processed >= limit_probs && break
     end
-    print(length(all_answers))
     println("\n=== Summary ===")
     println("Processed problems : ", processed)
     println("Fully solved       : ", solved)

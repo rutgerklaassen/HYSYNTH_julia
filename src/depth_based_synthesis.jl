@@ -13,6 +13,22 @@ export DepthCostBasedBottomUpIterator,
        apply_probe_update!,           # <- new: single call from your outer loop
        program_rule_count             # <- handy metric for “smaller is better” tie-break
 
+mutable struct ResetVariables
+    depth_exhausted::Bool
+    reset_count::Int
+    max_resets::Int
+    seen_shapes::Set{UInt64}
+    seen_amount::Int
+end
+
+InitialiseResetVariables() = ResetVariables(
+    false,   # depth_exhausted
+    0,        # reset_count
+    100,
+    Set{UInt64}(),
+    0
+)
+
 # ---------- iterator definition (add JIT fields & toggle) ----------
 @programiterator DepthCostBasedBottomUpIterator(
     bank=CostBank(),
@@ -21,13 +37,17 @@ export DepthCostBasedBottomUpIterator,
     logp_by_depth::Matrix{Float64},        # current, mutable costs
     base_logp_by_depth::Matrix{Float64}=copy(logp_by_depth),   # frozen base costs
     fit::Matrix{Float64}=zeros(size(logp_by_depth)),            # same shape: (rules × depth)
-    jit_enabled::Bool=false                                                   # toggle
+    jit_enabled::Bool=false,
+    reset_variables=InitialiseResetVariables(),         
 ) <: AbstractCostBasedBottomUpIterator
+
+get_reset_variables(iter::DepthCostBasedBottomUpIterator) = iter.reset_variables
 
 # BOUNDED MAX-HEAP OF BEST PARENTS BY DEPTH-AWARE LB
 struct ParentCand
     lb::Float64
     hole::UniformHole
+    fp::UInt64
 end
 Base.isless(a::ParentCand, b::ParentCand) = a.lb > b.lb
 
@@ -48,7 +68,9 @@ function build_depth_aware_axes(
 
     if isempty(hole.children)
         # Leaf hole: only terminals anyway
-        term_inds  = findall(hole.domain)
+        term_mask  = grammar.isterminal .& hole.domain
+        term_inds  = findall(term_mask)
+        isempty(term_inds) && return axes   # dead end leaf
         term_costs = Float64[_cost(iter, ridx, d) for ridx in term_inds]
         push!(axes, Axis(path, term_inds, term_costs))
         return axes
@@ -68,10 +90,13 @@ function build_depth_aware_axes(
         return axes
     end
 
-    # Below max depth: allow operator choices and recurse into children
-    op_inds  = findall(hole.domain)
+    # Below max depth: allow operator choices (nonterminals) and recurse into children
+    op_mask  = (.~grammar.isterminal) .& hole.domain
+    op_inds  = findall(op_mask)
+    isempty(op_inds) && return axes   # no ops → nothing buildable here
     op_costs = Float64[_cost(iter, ridx, d) for ridx in op_inds]
     push!(axes, Axis(path, op_inds, op_costs))
+
     @inbounds for (j, ch) in pairs(hole.children)
         child_path = (path..., j)
         append!(axes, build_depth_aware_axes(iter, grammar, ch; path=child_path, depth=depth+1))
@@ -118,34 +143,34 @@ function program_rule_count(node::Union{UniformHole,HerbConstraints.StateHole})
     return total
 end
 
-function HerbSearch.enqueue_entry_costs!(
-    iter::DepthCostBasedBottomUpIterator,
-    uh_id::Int, 
-    n::Int  # how many lowest-cost trees to enqueue
-)
-    bank  = get_bank(iter)
-    ent   = bank.uh_index[uh_id]
-    limit = get_measure_limit(iter)
-    costs = ent.sorted_costs
+# function HerbSearch.enqueue_entry_costs!(
+#     iter::DepthCostBasedBottomUpIterator,
+#     uh_id::Int, 
+#     n::Int  # how many lowest-cost trees to enqueue
+# )
+#     bank  = get_bank(iter)
+#     ent   = bank.uh_index[uh_id]
+#     limit = get_measure_limit(iter)
+#     costs = ent.sorted_costs
 
-    # keep indices with cost ≤ limit
-    idxs = [i for (i, c) in pairs(costs) if c ≤ limit]
-    isempty(idxs) && return nothing
+#     # keep indices with cost ≤ limit
+#     idxs = [i for (i, c) in pairs(costs) if c ≤ limit]
+#     isempty(idxs) && return nothing
 
-    # choose the n smallest by cost
-    if n < length(idxs)
-        perm = partialsortperm(idxs, 1:n; by = i -> costs[i])
-        idxs = idxs[perm]
-    else
-        sort!(idxs; by = i -> costs[i])
-    end
+#     # choose the n smallest by cost
+#     if n < length(idxs)
+#         perm = partialsortperm(idxs, 1:n; by = i -> costs[i])
+#         idxs = idxs[perm]
+#     else
+#         sort!(idxs; by = i -> costs[i])
+#     end
 
-    @inbounds for i in idxs
-        c = costs[i]
-        enqueue!(bank.pq, (uh_id, i), c)
-    end
-    return nothing
-end
+#     @inbounds for i in idxs
+#         c = costs[i]
+#         enqueue!(bank.pq, (uh_id, i), c)
+#     end
+#     return nothing
+# end
 
 function HerbSearch.populate_bank!(iter::DepthCostBasedBottomUpIterator)
     grammar = get_grammar(iter.solver)
@@ -218,11 +243,41 @@ _lb_uniformhole(iter::DepthCostBasedBottomUpIterator,
                 grammar::AbstractGrammar,
                 hole::UniformHole)::Float64 = _lb_uniformhole!(iter, grammar, hole, 1)
 
+@inline function _mix(h::UInt64, x::UInt64)
+    h ⊻= x
+    return h * 0x00000100000001B3 % UInt64  # FNV-1a style mix
+end
+
+function shape_fingerprint(u::UniformHole)::UInt64
+    # Hash the domain bitvector and recursively the children
+    h = 0xcbf29ce484222325 % UInt64
+    # domain bits
+    @inbounds for b in u.domain
+        h = _mix(h, UInt64(b))
+    end
+    # children
+    @inbounds for c in u.children
+        h = _mix(h, shape_fingerprint(c))
+    end
+    return h
+end
+
+function tree_depth(node)::Int
+    isempty(_children(node)) && return 1
+    m = 0
+    @inbounds for c in _children(node)
+        d = tree_depth(c); d > m && (m = d)
+    end
+    return 1 + m
+end
+
 function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
     bank       = get_bank(iter)
+    reset_variables       = get_reset_variables(iter)
     grammar    = get_grammar(iter.solver)
     size_limit  = get_max_size(iter)
     depth_limit = get_max_depth(iter)
+    enqueued_this_call = Set{UInt64}()  # prevents duplicate heap inserts this pass
 
     ######DEBUGGING######
     println("UH INDEX : ", length(bank.uh_index))
@@ -254,7 +309,8 @@ function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
     nonterm   = .~terminals
     shapes    = UniformHole.(partition(Hole(nonterm), grammar), ([],))
 
-
+    total_child_tuples  = 0
+    pruned_by_depthsize = 0
     heap = BinaryMaxHeap{ParentCand}()
 
     for shape in shapes
@@ -276,18 +332,29 @@ function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
         for tuple_children in Iterators.product(candidates...)
             any_new = any( (id ∈ newly_flagged_ids) for (id, _e) in tuple_children )
             any_new || continue
-
+            total_child_tuples += 1
             parent_hole = UniformHole(
                 shape.domain,
                 UniformHole[e.hole for (_id, e) in tuple_children]
             )
-            
-            if length(parent_hole) > size_limit || program_rule_count(parent_hole) > depth_limit
+            finger = shape_fingerprint(parent_hole)
+            if finger ∈ reset_variables.seen_shapes
+                # We built this parent shape in a previous epoch; skip it
+                reset_variables.seen_amount += 1
+                # continue
+            end
+            # Skip if we already pushed this shape into the heap in THIS combine call
+            # if finger ∈ enqueued_this_call
+            #     println("")
+            # end
+            if length(parent_hole) > size_limit || program_rule_count(parent_hole) > tree_depth(parent_hole) * 2 || tree_depth(parent_hole) > 9 || program_rule_count(parent_hole) > 12
+                pruned_by_depthsize += 1
                 continue
             end
 
             lb = _lb_uniformhole(iter, grammar, parent_hole)  # depth-aware from logp_by_depth
-            push!(heap, ParentCand(lb, parent_hole))
+            push!(heap, ParentCand(lb, parent_hole, finger))
+            push!(enqueued_this_call, finger)  # local mark only
             if length(heap) > top_n
                 pop!(heap)  # evict worst (highest) lb
             end
@@ -303,14 +370,24 @@ function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
     added_ids = Int[]
     while !isempty(heap)
         cand = pop!(heap)
+        if cand.fp ∈ reset_variables.seen_shapes
+            # continue
+        end
         uh_id = add_to_bank!(iter, cand.hole)
         push!(added_ids, uh_id)
+        push!(reset_variables.seen_shapes, cand.fp)
     end
 
     for uh_id in added_ids
         enqueue_entry_costs!(iter, uh_id)
     end
        
+    reset_variables.depth_exhausted = (
+        isempty(added_ids) &&       # nothing new could be added
+        total_child_tuples > 0 &&   # there were tuples to try
+        pruned_by_depthsize == total_child_tuples # all were blocked by depth/size
+    )
+
     out = CostAccessAddress[]
     for uh_id in added_ids
         ent  = bank.uh_index[uh_id]
@@ -322,6 +399,8 @@ function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
             end
         end
     end
+    println("\n SEEEN AMOUNT : ", reset_variables.seen_amount)
+    println("OUT SIZE : ", length(out))
     sort!(out; by = a -> a.cost)
     return out, state
 end
@@ -421,5 +500,53 @@ function apply_probe_update!(
     probe_update_costs!(iter.logp_by_depth, iter.base_logp_by_depth, get_grammar(iter.solver), iter.fit)
     return true
 end
+
+function _reset_bank_and_seed!(iter::DepthCostBasedBottomUpIterator)
+    bank = get_bank(iter)
+    empty!(bank.uh_index)
+    empty!(bank.pq)
+    bank.next_id[] = 1
+
+    # Re-seed from terminals using your populate function that enqueues entries.
+    # We don't return addrs here; the outer iterate() will re-call populate_bank!
+    nothing
+end
+
+function Base.iterate(iter::DepthCostBasedBottomUpIterator)
+    grammar = get_grammar(iter.solver)
+    # Check whether all probabilities are negative, or all costs are positive.
+#    @assert all(p <= 0 for p in grammar.log_probabilities) ||
+#         all(c > 0 for c in grammar.log_probabilities)
+#
+    addrs = populate_bank!(iter)
+    solver = get_solver(iter)
+    start  = get_tree(solver)
+    st = GenericBUState(addrs, nothing, nothing, start)
+    return Base.iterate(iter, st)
+end
+
+
+function Base.iterate(iter::DepthCostBasedBottomUpIterator, state::GenericBUState)
+
+    reset_variables = get_reset_variables(iter)
+    if reset_variables.depth_exhausted && (reset_variables.reset_count < reset_variables.max_resets)
+        reset_variables.reset_count += 1
+        reset_variables.depth_exhausted = false  # consume the f
+        _reset_bank_and_seed!(iter)
+        return Base.iterate(iter)
+    end
+    if isempty(state.combinations)
+        addrs, _ = combine(iter, state)
+        if isempty(addrs)
+            return nothing
+        end
+        state.combinations = addrs
+    end
+
+    addr = popfirst!(state.combinations)
+    prog = retrieve(iter, addr)
+    return prog, state
+end
+
 
 end # module
