@@ -279,6 +279,15 @@ function map_answers_by_hash(run_rows::Vector{Any}; base::AbstractString=".")
     return mp
 end
 
+
+function write_json(path::AbstractString, obj)
+    dir = dirname(path)
+    isdir(dir) || mkpath(dir)
+    open(path, "w") do io
+        JSON.print(io, obj;)  # pretty-printed JSON
+    end
+end
+
 # =================== Main flow ===================
 function main()
     cfg = parse_args()
@@ -286,9 +295,13 @@ function main()
     prompts_dir  = cfg["--prompts-dir"]
     runs_dir     = cfg["--runs-dir"]
     model_filter = cfg["--model"]
+    
     nrows        = parse(Int, cfg["--nrows"])
     max_answers  = isempty(cfg["--max-answers"]) ? typemax(Int) : parse(Int, cfg["--max-answers"])
     limit_probs  = isempty(cfg["--limit"]) ? typemax(Int) : parse(Int, cfg["--limit"])
+    llm_enabled      = get(cfg, "--llm_enabled", "false") == "true"
+    updating_enabled = get(cfg, "--updating_enabled", "false") == "true"
+    traces_enabled   = get(cfg, "--traces_enabled", "false") == "true"
 
     println("=== Build PCFGs from answers & run depth-based synthesis ===")
     println("dataset     : $dataset_path")
@@ -297,59 +310,76 @@ function main()
     println("model_filter: $(isempty(model_filter) ? "<any>" : model_filter)")
     println("nrows(depth): $nrows")
 
-    # Load dataset
-    ds = Serialization.deserialize(dataset_path)
-    nprogs = length(ds.programs)
-    println("Loaded dataset with $nprogs programs.")
-    # Load prompt index maps
-    by_file, by_pid_map, by_hash = load_prompt_index(prompts_dir)
-
-    # Collect all run rows (optionally filtered by model) and map to problem_id -> answers
+    # Collect run rows and map answers
     run_rows = collect_run_rows(runs_dir; model_filter=model_filter)
     manifest_base = realpath(joinpath(prompts_dir, ".."))  # project root: parent of prompts/
     answers_by_hash = map_answers_by_hash(run_rows; base=manifest_base)
 
-    # Grammar to use everywhere
+    # Output paths (JSON, not JSONL)
+    out_dir      = joinpath(manifest_base, "runs")
+    isdir(out_dir) || mkpath(out_dir)
+    per_problem  = joinpath(out_dir, "synthesis_stats.json")
+    summary_path = joinpath(out_dir, "synthesis_summary.json")
+
+    # Load dataset
+    ds = Serialization.deserialize(dataset_path)
+    nprogs = length(ds.programs)
+    println("Loaded dataset with $nprogs programs.")
+
+    # Load prompt index maps
+    _, by_pid_map, _ = load_prompt_index(prompts_dir)
+
+    # Grammar
     G = KarelUtils.grammar_karel
 
     processed = 0
     solved = 0
-    first = 0
+    results = Any[]
 
-    # Iterate problems in the dataset
+    # Iterate problems
     for (pid, rec) in enumerate(ds.programs)
-        # Their problem_id keys look like: karel_by_depth::<sha8>::p0001
-        # Find any prompt index entry that has this pid and build problem_id strings.
-        # Prompt index JSONL already contains "problem_id" per pid.
-        # We'll locate the record by scanning (pid match) once for speed.
-
-        # find the index record for this pid (O(n) the first time; acceptable)
+        # find index record for this pid
         idx_rec = nothing
         for (_, recidx) in by_pid_map
-            # by_pid_map keyed by problem_id; values contain pid
-            # Be tolerant to Int/Number vs String
             if Int(recidx["pid"]) == pid
                 idx_rec = recidx
                 break
             end
         end
         idx_rec === nothing && continue
+
         problem_hash = haskey(idx_rec, "problem_hash") ? String(idx_rec["problem_hash"]) : ""
         if isempty(problem_hash)
             @info "No problem_hash in index; skipping for safety" pid
             continue
         end
-        ans_paths = get(answers_by_hash, problem_hash, String[])
+
+        ans_paths  = get(answers_by_hash, problem_hash, String[])
         problem_id = String(idx_rec["problem_id"])
         depth      = Int(idx_rec["depth"])
-        # ans_paths  = get(answers_by_problem, problem_id, String[])
 
         if isempty(ans_paths)
             @info "No answers for problem" pid problem_id depth
+            # still record a row so the JSON mirrors the dataset coverage
+            push!(results, Dict(
+                "pid"            => pid,
+                "problem_id"     => problem_id,
+                "problem_hash"   => problem_hash,
+                "depth"          => depth,
+                "answers_total"  => 0,
+                "answers_parsed" => 0,
+                "steps_iterated" => 0,
+                "best_hits"      => 0,
+                "best_size"      => nothing,
+                "solved"         => false,
+                "timestamp_utc"  => Dates.format(now(UTC), dateformat"yyyy-mm-ddTHH:MM:SS\\Z")
+            ))
+            processed += 1
+            processed >= limit_probs && break
             continue
         end
 
-        # Read all answers (up to max_answers) and parse
+        # Read answers and parse
         trees = Any[]
         taken = 0
         for ap in ans_paths
@@ -375,44 +405,112 @@ function main()
 
         if isempty(trees)
             @info "All answers failed to parse" pid problem_id
+            push!(results, Dict(
+                "pid"            => pid,
+                "problem_id"     => problem_id,
+                "problem_hash"   => problem_hash,
+                "depth"          => depth,
+                "answers_total"  => length(ans_paths),
+                "answers_parsed" => 0,
+                "steps_iterated" => 0,
+                "best_hits"      => 0,
+                "best_size"      => nothing,
+                "solved"         => false,
+                "timestamp_utc"  => Dates.format(now(UTC), dateformat"yyyy-mm-ddTHH:MM:SS\\Z")
+            ))
+            processed += 1
+            processed >= limit_probs && break
             continue
         end
 
-        # Accumulate matrices over trees
+        # Accumulate and convert to costs
         M_sum, rules, nvalid = accumulate_counts_matrix(trees; G=G, nrows=nrows)
         if M_sum === nothing
             @info "Could not form counts matrix" pid
+            push!(results, Dict(
+                "pid"            => pid,
+                "problem_id"     => problem_id,
+                "problem_hash"   => problem_hash,
+                "depth"          => depth,
+                "answers_total"  => length(ans_paths),
+                "answers_parsed" => 0,
+                "steps_iterated" => 0,
+                "best_hits"      => 0,
+                "best_size"      => nothing,
+                "solved"         => false,
+                "timestamp_utc"  => Dates.format(now(UTC), dateformat"yyyy-mm-ddTHH:MM:SS\\Z")
+            ))
+            processed += 1
+            processed >= limit_probs && break
             continue
         end
 
-        # Convert frequencies to costs
         C = Grammar.frequencies_to_costs(M_sum, rules; alpha=1.0, eps=1e-3)
-        C = permutedims(C, (2,1)) # Transpose because I built the other thing with different columns /
-
-        # Pretty-print a tiny summary (optional)
+        C = permutedims(C, (2,1))
+        
         @printf("\n[PID %4d | depth %2d] answers=%d (parsed=%d)\n",
                 pid, depth, length(ans_paths), nvalid)
         println("  counts-matrix size: ", size(M_sum), " -> cost size: ", size(C))
 
-        # Run your new iterator for this problem
+        # Run iterator
         res = run_depth_iter_for_problem(ds, pid, G, C;
             max_cost=1e9, max_depth=8, max_size=10000, jit_enabled=true
         )
         println("SOLVED : ", res.solved)
+
         processed += 1
-        @printf("  search steps: %-8d  best_hits: %d  size: %d\n",
-                res.steps, res.best_hits, res.best_size)
         if res.solved
             solved += 1
         end
-        # Optional: stop after limit for quick sanity checks
+
+        push!(results, Dict(
+            "pid"            => pid,
+            "problem_id"     => problem_id,
+            "problem_hash"   => problem_hash,
+            "depth"          => depth,
+            "answers_total"  => length(ans_paths),
+            "answers_parsed" => nvalid,
+            "steps_iterated" => res.steps,
+            "best_hits"      => res.best_hits,
+            "best_size"      => res.best_size,
+            "solved"         => res.solved,
+            "timestamp_utc"  => Dates.format(now(UTC), dateformat"yyyy-mm-ddTHH:MM:SS\\Z")
+        ))
+
+        @printf("  search steps: %-8d  best_hits: %d  size: %d\n",
+                res.steps, res.best_hits, res.best_size)
+
         processed >= limit_probs && break
     end
+
     println("\n=== Summary ===")
     println("Processed problems : ", processed)
     println("Fully solved       : ", solved)
-    println("Timestamp          : ", Dates.format(now(UTC), dateformat"yyyy-mm-ddTHH:MM:SS\Z"))
+    println("Timestamp          : ", Dates.format(now(UTC), dateformat"yyyy-mm-ddTHH:MM:SS\\Z"))
+
+    # ---- Write JSON outputs ----
+    # Per-problem: array of Dicts
+    write_json(per_problem, results)
+
+    # Summary: single Dict
+    summary = Dict(
+        "processed"      => processed,
+        "solved"         => solved,
+        "dataset_path"   => dataset_path,
+        "prompts_dir"    => prompts_dir,
+        "runs_dir"       => runs_dir,
+        "model_filter"   => model_filter,
+        "nrows"          => nrows,
+        "max_answers"    => max_answers,
+        "limit"          => limit_probs,
+        "timestamp_utc"  => Dates.format(now(UTC), dateformat"yyyy-mm-ddTHH:MM:SS\\Z")
+    )
+    write_json(summary_path, summary)
+
+    println("\nWrote per-problem stats to: $(per_problem)")
+    println("Wrote summary to           : $(summary_path)")
 end
+
 
 # =================== Entry ===================
 if abspath(PROGRAM_FILE) == @__FILE__

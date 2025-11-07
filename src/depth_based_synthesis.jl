@@ -293,7 +293,7 @@ function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
 
     
     # tune or promote to a field later
-    top_n = 30
+    top_n = 1
 
     newly_flagged_ids = Set{Int}()
     for (id, ent) in bank.uh_index

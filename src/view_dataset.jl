@@ -134,6 +134,75 @@ function export_program!(rec; path::AbstractString=CURATED_PATH)
     return :exported
 end
 
+# --- deletion helpers -------------------------------------------------------
+
+normalize_prog_text(x) = strip(Base.unescape_string(String(x)))  # already defined above
+
+# true if a record/string matches the given program text (normalized)
+function same_prog_text(r, target_norm::AbstractString)
+    if r isa AbstractString
+        return normalize_prog_text(r) == target_norm
+    elseif hasproperty(r, :program)
+        return normalize_prog_text(getproperty(r, :program)) == target_norm
+    elseif r isa NamedTuple && :program in propertynames(r)
+        return normalize_prog_text(getfield(r, :program)) == target_norm
+    else
+        return false
+    end
+end
+
+# Delete from curated file; returns :deleted or :not_found
+function delete_from_curated_by_text!(prog_text::AbstractString; path::AbstractString=CURATED_PATH)
+    curated = load_curated_programs(path)
+    isempty(curated) && return :not_found
+
+    target = normalize_prog_text(prog_text)
+    keep = [r for r in curated if !same_prog_text(r, target)]
+    if length(keep) == length(curated)
+        return :not_found
+    end
+    save_curated_programs!(keep; path=path)
+    return :deleted
+end
+
+# Delete from a dataset file (the one opened with --dataset/--alt).
+# Tries to preserve :target and :max_depth metadata if present.
+function delete_from_dataset_by_text!(dataset_path::AbstractString, prog_text::AbstractString)
+    ds = safe_deserialize(dataset_path)
+    hasproperty(ds, :programs) || error("Dataset '$dataset_path' has no :programs field.")
+    progs = Vector{Any}(ds.programs)
+
+    target = normalize_prog_text(prog_text)
+    keep = [r for r in progs if !same_prog_text(r, target)]
+    if length(keep) == length(progs)
+        return :not_found
+    end
+
+    # preserve metadata if present
+    target_meta    = hasproperty(ds, :target)    ? getproperty(ds, :target)    : nothing
+    max_depth_meta = hasproperty(ds, :max_depth) ? getproperty(ds, :max_depth) : nothing
+
+    out_obj = if target_meta === nothing && max_depth_meta === nothing
+        (; programs = keep)
+    elseif target_meta === nothing
+        (; max_depth = max_depth_meta, programs = keep)
+    elseif max_depth_meta === nothing
+        (; target = target_meta, programs = keep)
+    else
+        (; target = target_meta, max_depth = max_depth_meta, programs = keep)
+    end
+
+    serialize(dataset_path, out_obj)
+    return :deleted
+end
+
+# simple yes/no prompt (default = No)
+function confirm(prompt::AbstractString)
+    print(prompt * " [y/N]: ")
+    ans = lowercase(strip(readline(stdin)))
+    return ans in ("y","yes")
+end
+
 
 function print_world(rec, world_idx::Int)
     nw = length(rec.worlds)
@@ -330,20 +399,43 @@ function main()
                 nw = length(rec.worlds)
                 world_labels = [@sprintf("World %d", i) for i in 1:nw]
                 while true
-                    # Added "Export" button under Back
-                    world_menu = ["◀ Back to program list", "💾 Export this program", world_labels...]
-                    wsel = pick_from_menu("Select a world to view:", world_menu)
+                    world_menu = [
+                        "◀ Back to program list",
+                        "Export this program to curated dataset",
+                        "Delete this program from curated dataset",
+                        "Delete this program from SOURCE dataset",
+                        world_labels...
+                    ]
+
+                    wsel = pick_from_menu("Select an action/world:", world_menu)
                     if wsel == 1
                         # back to program list
                         break
                     elseif wsel == 2
                         export_program!(rec; path=CURATED_PATH)
-                        # stay in the world menu
-                        continue
+                        # stay here
+                    elseif wsel == 3
+                        if confirm("Remove from curated dataset?")
+                            status = delete_from_curated_by_text!(rec.program; path=CURATED_PATH)
+                            println(status == :deleted ? "Deleted from curated dataset." : "Not found in curated dataset.")
+                        end
+                    elseif wsel == 4
+                        # delete from the dataset currently opened (dataset or alt)
+                        # 'dataset' comes from parse_cli_args; thread it down by capturing in a closure
+                        if confirm("Remove from SOURCE dataset?")
+                            status = delete_from_dataset_by_text!(dataset, rec.program)
+                            println(status == :deleted ? "Deleted from source dataset." : "Not found in source dataset.")
+                            if status == :deleted
+                                # Also remove from the in-memory 'progs' so the UI stays consistent
+                                progs = load_fixed_dataset(dataset; path_alt=alt)
+                                depths, bydepth = group_programs_by_depth(progs)
+                                # jump back up to refresh the lists
+                                break
+                            end
+                        end
                     else
-                        widx = wsel - 2  # adjust index because of Back + Export
+                        widx = wsel - 4  # adjust because we inserted 3 extra actions
                         print_world(rec, widx)
-                        # After printing, stay in the world menu
                     end
                 end
             end
