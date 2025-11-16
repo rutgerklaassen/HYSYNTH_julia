@@ -1,13 +1,13 @@
 #!/usr/bin/env julia
 
 # =================== Includes (your local modules) ===================
-# Make sure these files are in the same folder or adjust the paths below.
 include("parseKarel.jl")
 include("grammar.jl")
 include("hysynth.jl")
 include("utils.jl")
 include("depth_based_synthesis.jl")
 include("karel_utils.jl")
+include("probe_update.jl")
 
 using .ParseKarel
 using .Grammar
@@ -15,6 +15,7 @@ using .Hysynth
 using .Depth_synthesis
 using .Utils
 using .KarelUtils
+using .ProbeUpdate
 
 using HerbSearch, HerbGrammar, HerbBenchmarks, HerbConstraints, HerbCore, HerbSpecification, HerbInterpret
 using Serialization
@@ -29,13 +30,13 @@ function parse_args()
     args = Dict{String, String}()
 
     # defaults
-    args["--dataset"] = get(ENV, "KAREL_DATASET", "karel_dataset_by_depth.jls")
+    args["--dataset"]     = get(ENV, "KAREL_DATASET", "karel_dataset_by_depth.jls")
     args["--prompts-dir"] = get(ENV, "PROMPTS_DIR", "prompts")
-    args["--runs-dir"] = get(ENV, "RUNS_DIR", "runs")
-    args["--model"] = get(ENV, "MODEL_FILTER", "")             # optional: only use runs for this model
-    args["--max-answers"] = get(ENV, "MAX_ANSWERS", "")        # optional: cap answers per problem
-    args["--nrows"] = get(ENV, "DEPTH_ROWS", "6")              # rows = depth buckets for counts_matrix
-    args["--limit"] = get(ENV, "LIMIT", "")                    # optional: max problems to process
+    args["--runs-dir"]    = get(ENV, "RUNS_DIR", "runs")
+    args["--model"]       = get(ENV, "MODEL_FILTER", "")             # optional: only use runs for this model
+    args["--max-answers"] = get(ENV, "MAX_ANSWERS", "")              # optional: cap answers per problem
+    args["--nrows"]       = get(ENV, "DEPTH_ROWS", "6")              # rows = depth buckets for counts_matrix
+    args["--limit"]       = get(ENV, "LIMIT", "")                    # optional: max problems to process
 
     # crude flag parser
     i = 1
@@ -116,154 +117,6 @@ function map_answers_by_problem(run_rows::Vector{Any}; base::AbstractString=".")
     return mp
 end
 
-# =================== Parsing & Aggregation ===================
-
-# Try to parse one answer text into a tree; returns Union{Nothing, Any}
-function try_parse_answer(txt::AbstractString)
-    s = strip(txt)
-    isempty(s) && return nothing
-    try
-        return ParseKarel.parse_llm_response(String(s))
-    catch e
-        @warn "Parse failed" err=e
-        return nothing
-    end
-end
-
-# For a set of trees, accumulate counts into a *single numeric matrix*:
-# We avoid depending on internal layout of counts_by_depth by converting
-# each tree's counts into a matrix via Utils.counts_matrix(...), then summing.
-function accumulate_counts_matrix(trees::Vector; G::AbstractGrammar, nrows::Int)
-    M_sum = nothing
-    rules_ref = nothing
-    valid = 0
-    for t in trees
-        t === nothing && continue
-        _, counts_by_depth = Utils.print_tree(t)
-        M, rules = Utils.counts_matrix(counts_by_depth, G; nrows=nrows)
-        if M_sum === nothing
-            M_sum = copy(M)
-            rules_ref = rules
-        else
-            # Basic sanity: rules order should be identical; if not, we could align,
-            # but Utils.counts_matrix for the same grammar should be stable.
-            if length(rules) != length(rules_ref) || any(rules .!= rules_ref)
-                error("counts_matrix returned different rule ordering; please align columns explicitly.")
-            end
-            M_sum .+= M
-        end
-        valid += 1
-    end
-    return M_sum, rules_ref, valid
-end
-
-const FNV_OFFSET64 = 0xcbf29ce484222325 % UInt64
-const FNV_PRIME64  = 0x00000100000001B3 % UInt64
-
-function _canon(expr::AbstractString)
-    # collapse whitespace & trim; tweak if you want stricter/looser canon
-    return replace(strip(expr), r"\s+" => " ")
-end
-
-function prog_fingerprint(expr::AbstractString)::UInt64
-    h = FNV_OFFSET64
-    ce = _canon(expr)
-    @inbounds for b in codeunits(ce)
-        h ⊻= UInt64(b)
-        h *= FNV_PRIME64
-    end
-    return h
-end
-
-# returns (frozen_node_or_nothing, ok::Bool)
-safe_freeze(p) = try
-    (freeze_state(p), true)
-catch e
-    if e isa AssertionError
-        (nothing, false)   # <- ALWAYS a 2-tuple
-    else
-        rethrow()
-    end
-end
-
- prog_fingerprint(x)::UInt64 = prog_fingerprint(repr(x))
-# =================== Synthesis runner (your new iterator) ===================
-
-# Evaluate a single problem (by pid) with a cost matrix:
-function run_depth_iter_for_problem(ds, pid::Int, G::AbstractGrammar, C::Matrix{Float64};
-                                    max_cost=1e9, max_depth=10, max_size=50, jit_enabled=false)
-
-    rec  = ds.programs[pid]
-    prob = Problem("karel-traces", rec.traces)
-    # println(prob)
-    it = DepthCostBasedBottomUpIterator(G, :Start, C;
-        bank=HerbSearch.CostBank(),
-        max_cost=max_cost, max_depth=max_depth, max_size=max_size,
-        jit_enabled=jit_enabled   
-    )
-    best_hits = 0
-    best_size = typemax(Int)
-    best_extra = 0
-    best_prog = nothing
-    solved = false
-    reset_variables = Depth_synthesis.get_reset_variables(it)
-    st = nothing
-    nxt = iterate(it)
-    steps = 0
-    seen = Set{UInt64}()   # note the parentheses!
-    saw = 0
-    while nxt !== nothing
-        (p, st) = nxt
-        fpnode, ok = safe_freeze(p)
-        if !ok
-            nxt = iterate(it, st)
-            continue
-        end
-        steps += 1
-
-        if steps % 1000 == 0
-            println(steps)
-        end
-        expr = rulenode2expr(fpnode, G)
-        fp   = prog_fingerprint(expr)
-        if fp ∈ seen
-            saw += 1
-            nxt = iterate(it, st)   # <-- advance the iterator!
-            continue # Already saw this program
-        else
-            push!(seen, fp)
-        end
-
-        
-
-        hits, total, extra = KarelUtils.count_matches(fpnode, prob, G)
-        strict_ok = KarelUtils.satisfies_problem_strict(fpnode, prob, G)
-
-        sz = program_rule_count(p)
-        # if steps % 500 == 0
-        #     println(steps)
-        #     println(sz)
-        # end
-        if strict_ok
-            println("program ", rulenode2expr(fpnode, G), "(",fpnode,")", " is an exact hit with size ", sz)
-            solved = true
-            return (; steps, best_hits, best_size, best_prog, solved)
-        end
-        improved = (hits > best_hits) || (hits == best_hits && extra < best_extra) || (hits == best_hits && extra == best_extra && sz < best_size)
-        if improved
-            best_hits = hits; best_size = sz; best_prog = p; best_extra = extra;
-            println("program ", rulenode2expr(freeze_state(p), G), "(",fpnode,")", " is a new best hit! ", best_hits , " out of ", total, " with ",extra," extra steps ", " and size ", sz, " and depth ", Depth_synthesis.tree_depth(p))
-            apply_probe_update!(it, p, hits, total)
-            reset_variables.depth_exhausted = true
-            # if hits == total
-            #     return (; steps, best_hits, best_size, best_prog)
-            # end
-        end
-        nxt = iterate(it, st)
-    end
-    return (; steps, best_hits, best_size, best_prog, solved)
-end
-
 # Build: problem_hash -> Vector{String} (answer paths)
 function map_answers_by_hash(run_rows::Vector{Any}; base::AbstractString=".")
     mp = Dict{String, Vector{String}}()
@@ -279,13 +132,201 @@ function map_answers_by_hash(run_rows::Vector{Any}; base::AbstractString=".")
     return mp
 end
 
-
 function write_json(path::AbstractString, obj)
     dir = dirname(path)
     isdir(dir) || mkpath(dir)
     open(path, "w") do io
-        JSON.print(io, obj;)  # pretty-printed JSON
+        JSON.print(io, obj;)
     end
+end
+
+# =================== Parsing & Aggregation ===================
+
+# Try to parse one answer text into a tree; returns Union{Nothing, Any}
+function try_parse_answer(txt::AbstractString)
+    s = strip(txt)
+    isempty(s) && return nothing
+    try
+        return ParseKarel.parse_llm_response(String(s))
+    catch e
+        @warn "Parse failed" err=e
+        return nothing
+    end
+end
+
+# For a set of trees, accumulate counts into a single numeric matrix:
+function accumulate_counts_matrix(trees::Vector; G::AbstractGrammar, nrows::Int)
+    M_sum = nothing
+    rules_ref = nothing
+    valid = 0
+    for t in trees
+        t === nothing && continue
+        _, counts_by_depth = Utils.print_tree(t)
+        M, rules = Utils.counts_matrix(counts_by_depth, G; nrows=nrows)
+        if M_sum === nothing
+            M_sum = copy(M)
+            rules_ref = rules
+        else
+            if length(rules) != length(rules_ref) || any(rules .!= rules_ref)
+                error("counts_matrix returned different rule ordering; please align columns explicitly.")
+            end
+            M_sum .+= M
+        end
+        valid += 1
+    end
+    return M_sum, rules_ref, valid
+end
+
+const FNV_OFFSET64 = 0xcbf29ce484222325 % UInt64
+const FNV_PRIME64  = 0x00000100000001B3 % UInt64
+
+function _canon(expr::AbstractString)
+    return replace(strip(expr), r"\s+" => " ")
+end
+
+function prog_fingerprint(expr::AbstractString)::UInt64
+    h = FNV_OFFSET64
+    ce = _canon(expr)
+    @inbounds for b in codeunits(ce)
+        h ⊻= UInt64(b)
+        h *= FNV_PRIME64
+    end
+    return h
+end
+
+prog_fingerprint(x)::UInt64 = prog_fingerprint(repr(x))
+safe_freeze(p) = try
+    (freeze_state(p), true)
+catch e
+    if e isa AssertionError
+        (nothing, false)
+    else
+        rethrow()
+    end
+end
+
+# =================== Iterator driver ===================
+function run_depth_iter_for_problem(ds, pid::Int, G::AbstractGrammar, C::Matrix{Float64};
+                                    max_cost=1e9, max_depth=10, max_size=50, jit_enabled, traces_enabled, depth_aware_enabled, probe_state=nothing, flat_probe_state=nothing)
+    rec  = ds.programs[pid]
+    prob = Problem("karel-traces", rec.traces)
+
+    if depth_aware_enabled
+        it = DepthCostBasedBottomUpIterator(G, :Start, C;
+            bank=HerbSearch.CostBank(),
+            max_cost=max_cost, max_depth=max_depth, max_size=max_size,
+            jit_enabled=jit_enabled
+        )
+    else
+        println("DEPTH TURNED OFF!!!!!!!!!!!!!!!!!!!!!")
+        # Non-depth path uses the same iterator, but with a single cost column (R × 1)
+        it = DepthCostBasedBottomUpIterator(G, :Start, C;
+            bank=HerbSearch.CostBank(),
+            max_cost=max_cost, max_depth=max_depth, max_size=max_size,
+            jit_enabled=jit_enabled
+        )
+    end
+    
+    best_hits = 0
+    best_size = typemax(Int)
+    best_extra = 0
+    best_prog = nothing
+    solved = false
+    reset_variables = Depth_synthesis.get_reset_variables(it)
+    st = nothing
+    nxt = iterate(it)
+    steps = 0
+    seen = Set{UInt64}()
+    while nxt !== nothing
+        (p, st) = nxt
+        fpnode, ok = safe_freeze(p)
+        if !ok
+            nxt = iterate(it, st)
+            continue
+        end
+
+        steps += 1
+        if steps % 1000 == 0
+            println(steps)
+        end
+
+        expr = rulenode2expr(fpnode, G)
+        fp   = prog_fingerprint(expr)
+        if fp ∈ seen
+            nxt = iterate(it, st)
+            continue
+        else
+            push!(seen, fp)
+        end
+
+        hits, total, extra = KarelUtils.count_matches(fpnode, prob, G)
+        strict_ok = KarelUtils.satisfies_problem_strict(fpnode, prob, G)
+        sz = program_rule_count(p)
+
+        if strict_ok
+            println("program ", rulenode2expr(fpnode, G), " is an exact hit with size ", sz)
+            solved = true
+            return (; steps, best_hits, best_size, best_prog, solved)
+        end
+        improved = false
+        if traces_enabled
+            hits, total, extra = KarelUtils.count_matches(fpnode, prob, G)     # trace-level progress
+            if hits > 0 
+                improved = (hits > best_hits) ||
+                    (hits == best_hits && extra < best_extra) ||
+                    (hits == best_hits && extra == best_extra && sz < best_size)
+            end
+        else
+            # world-level: only reward *complete* worlds
+            hits, total = KarelUtils.count_world_matches(fpnode, prob, G)
+            extra = 0
+            if hits > 0
+                improved = (hits > best_hits) || (hits == best_hits && sz < best_size)
+            end
+        end
+
+        if improved && jit_enabled
+            best_hits = hits; best_size = sz; best_prog = p; best_extra = extra;
+            println("program ", rulenode2expr(freeze_state(p), G),
+                    " is a new best hit! ", best_hits , " / ", total,
+                    " extra=", extra, " size=", sz, " depth=", Depth_synthesis.tree_depth(p))
+            if depth_aware_enabled
+
+                d0 = ProbeUpdate.default_depth0(HerbSearch.get_grammar(it.solver), p)
+                new_costs = ProbeUpdate.update_depth!(probe_state, HerbSearch.get_grammar(it.solver), p, hits, total; depth0=d0)
+                it.logp_by_depth .= new_costs
+            else
+                new_costs = ProbeUpdate.update_flat!(flat_probe_state, HerbSearch.get_grammar(it.solver), p, hits, total)               
+                it.logp_by_depth[:, 1] .= new_costs 
+            end
+            reset_variables !== nothing && (reset_variables.depth_exhausted = true)
+        end
+
+        nxt = iterate(it, st)
+    end
+
+    return (; steps, best_hits, best_size, best_prog, solved)
+end
+
+# =================== Experiment folder naming ===================
+function build_experiment_dir(manifest_base::AbstractString;
+    llm_enabled::Bool, traces_enabled::Bool, updating_enabled::Bool, depth_aware_enabled::Bool,
+    model_filter::String, nrows::Int, max_depth::Int)
+
+    parts = String[
+        llm_enabled      ? "llm"      : "nollm",
+        traces_enabled   ? "traces"   : "notraces",
+        updating_enabled ? "probe"    : "noprobe",
+        depth_aware_enabled ? "depth" : "nodepth",
+        isempty(model_filter) ? "model-any" : "model-" * replace(model_filter, r"[^A-Za-z0-9_.-]" => "_"),
+        "nrows-$(nrows)",
+        "md-$(max_depth)",
+        Dates.format(now(UTC), "yyyymmdd_HHMMSS")
+    ]
+    exp_root = joinpath(manifest_base, "experiments")
+    exp_dir  = joinpath(exp_root, join(parts, "__"))
+    isdir(exp_dir) || mkpath(exp_dir)
+    return exp_dir
 end
 
 # =================== Main flow ===================
@@ -295,13 +336,21 @@ function main()
     prompts_dir  = cfg["--prompts-dir"]
     runs_dir     = cfg["--runs-dir"]
     model_filter = cfg["--model"]
-    
+
     nrows        = parse(Int, cfg["--nrows"])
     max_answers  = isempty(cfg["--max-answers"]) ? typemax(Int) : parse(Int, cfg["--max-answers"])
     limit_probs  = isempty(cfg["--limit"]) ? typemax(Int) : parse(Int, cfg["--limit"])
     llm_enabled      = get(cfg, "--llm_enabled", "false") == "true"
     updating_enabled = get(cfg, "--updating_enabled", "false") == "true"
     traces_enabled   = get(cfg, "--traces_enabled", "false") == "true"
+    depth_aware_enabled = get(cfg, "--depth_aware_enabled", "false") == "true"
+    kernel_smoothing_enabled = get(cfg, "--kernel_smoothing_enabled", "false") == "true"
+    oracle = get(cfg, "--oracle_enabled", "false") == "true"
+
+    # Search knobs (lift to CLI later if desired)
+    search_max_cost  = 1e9
+    search_max_depth = 8
+    search_max_size  = 10000
 
     println("=== Build PCFGs from answers & run depth-based synthesis ===")
     println("dataset     : $dataset_path")
@@ -315,11 +364,17 @@ function main()
     manifest_base = realpath(joinpath(prompts_dir, ".."))  # project root: parent of prompts/
     answers_by_hash = map_answers_by_hash(run_rows; base=manifest_base)
 
-    # Output paths (JSON, not JSONL)
-    out_dir      = joinpath(manifest_base, "runs")
-    isdir(out_dir) || mkpath(out_dir)
-    per_problem  = joinpath(out_dir, "synthesis_stats.json")
-    summary_path = joinpath(out_dir, "synthesis_summary.json")
+    # Experiment directory
+    exp_dir = build_experiment_dir(manifest_base;
+        llm_enabled=llm_enabled, traces_enabled=traces_enabled, updating_enabled=updating_enabled, depth_aware_enabled=depth_aware_enabled,
+        model_filter=model_filter, nrows=nrows, max_depth=search_max_depth)
+
+    per_problem_path = joinpath(exp_dir, "per_problem.json")
+    summary_path     = joinpath(exp_dir, "summary.json")
+    bad_answers_dir  = joinpath(exp_dir, "bad_answers")
+    isdir(bad_answers_dir) || mkpath(bad_answers_dir)
+
+    println("\nWriting artifacts to: $exp_dir\n")
 
     # Load dataset
     ds = Serialization.deserialize(dataset_path)
@@ -360,7 +415,6 @@ function main()
 
         if isempty(ans_paths)
             @info "No answers for problem" pid problem_id depth
-            # still record a row so the JSON mirrors the dataset coverage
             push!(results, Dict(
                 "pid"            => pid,
                 "problem_id"     => problem_id,
@@ -386,13 +440,16 @@ function main()
             taken += 1
             taken > max_answers && break
             if isfile(ap)
-                txt = read(ap, String)
+                txt = ""
+                if oracle
+                    txt = rec.program
+                else
+                    txt = read(ap, String)
+                end
                 t = try_parse_answer(txt)
                 if t === nothing
-                    baddir = joinpath(runs_dir, "bad_answers")
-                    isdir(baddir) || mkpath(baddir)
                     outname = @sprintf("pid_%04d_sample_%04d.txt", pid, taken)
-                    open(joinpath(baddir, outname), "w") do io
+                    open(joinpath(bad_answers_dir, outname), "w") do io
                         write(io, txt)
                     end
                 else
@@ -425,6 +482,11 @@ function main()
 
         # Accumulate and convert to costs
         M_sum, rules, nvalid = accumulate_counts_matrix(trees; G=G, nrows=nrows)
+
+        if kernel_smoothing_enabled
+            M_sum = kernel_smoothing(M_sum, rules) #transpose it so it works with the function 
+        end
+        #println(size(M_sum))
         if M_sum === nothing
             @info "Could not form counts matrix" pid
             push!(results, Dict(
@@ -445,17 +507,56 @@ function main()
             continue
         end
 
-        C = Grammar.frequencies_to_costs(M_sum, rules; alpha=1.0, eps=1e-3)
-        C = permutedims(C, (2,1))
-        
+        CDepth = Grammar.frequencies_to_costs_depth(M_sum, rules; alpha=1.0, eps=1e-3)
+
+        CDepth = permutedims(CDepth, (2,1)) # We transpose it here to match the way we use it in the depthiterator
+
+        # exit()
+        # println(CDepth)
+        if !llm_enabled
+            CDepth .= 1.0
+        end
+        # println(CDepth)
         @printf("\n[PID %4d | depth %2d] answers=%d (parsed=%d)\n",
                 pid, depth, length(ans_paths), nvalid)
-        println("  counts-matrix size: ", size(M_sum), " -> cost size: ", size(C))
+        println("  counts-matrix size: ", size(M_sum), " -> cost size: ", size(CDepth))
 
-        # Run iterator
-        res = run_depth_iter_for_problem(ds, pid, G, C;
-            max_cost=1e9, max_depth=8, max_size=10000, jit_enabled=true
-        )
+        if depth_aware_enabled
+            # existing depth-aware iterator call (unchanged)
+            # println(CDepth)
+            for i in 1:size(CDepth, 1)
+                rule = rules[i]
+                row = CDepth[i, :]
+                println(@sprintf("%2d: %-40s  %s", i, rule, row,))
+            end
+            depth_state = ProbeUpdate.DepthProbeState(CDepth)  # baseline = the costs you just computed
+            res = run_depth_iter_for_problem(ds, pid, G, CDepth;
+                max_cost=search_max_cost, max_depth=search_max_depth,
+                max_size=search_max_size, jit_enabled=updating_enabled,
+                traces_enabled=traces_enabled, depth_aware_enabled=true, probe_state=depth_state)
+        else
+            # --- flat costs from LLM frequencies ---
+            Cflat = Grammar.frequencies_to_costs_flat(M_sum, rules)  # Vector{Float64} (R)
+            println(Cflat)
+            if !llm_enabled
+                Cflat .= 1.0
+            end
+            println(Cflat)
+            # 1-column adapter → depth-agnostic costs
+            C1 = reshape(Cflat, :, 1)                                # (R × 1)
+            flat_state = ProbeUpdate.FlatProbeState(Cflat)
+            # Pass C1 (not CDepth) to the iterator driver:
+            res = run_depth_iter_for_problem(
+                ds, pid, G, C1;                 # <-- this is the key change
+                max_cost=search_max_cost, max_depth=search_max_depth,
+                max_size=search_max_size,
+                jit_enabled=updating_enabled,
+                traces_enabled=traces_enabled,
+                depth_aware_enabled=false,
+                flat_probe_state=flat_state
+            )
+        end
+
         println("SOLVED : ", res.solved)
 
         processed += 1
@@ -490,27 +591,32 @@ function main()
 
     # ---- Write JSON outputs ----
     # Per-problem: array of Dicts
-    write_json(per_problem, results)
+    write_json(per_problem_path, results)
 
-    # Summary: single Dict
+    # Summary: single Dict (+ config for reproducibility)
     summary = Dict(
-        "processed"      => processed,
-        "solved"         => solved,
-        "dataset_path"   => dataset_path,
-        "prompts_dir"    => prompts_dir,
-        "runs_dir"       => runs_dir,
-        "model_filter"   => model_filter,
-        "nrows"          => nrows,
-        "max_answers"    => max_answers,
-        "limit"          => limit_probs,
-        "timestamp_utc"  => Dates.format(now(UTC), dateformat"yyyy-mm-ddTHH:MM:SS\\Z")
+        "processed"        => processed,
+        "solved"           => solved,
+        "dataset_path"     => dataset_path,
+        "prompts_dir"      => prompts_dir,
+        "runs_dir"         => runs_dir,
+        "model_filter"     => model_filter,
+        "nrows"            => nrows,
+        "max_answers"      => max_answers,
+        "limit"            => limit_probs,
+        "llm_enabled"      => llm_enabled,
+        "traces_enabled"   => traces_enabled,
+        "updating_enabled" => updating_enabled,
+        "search_max_cost"  => search_max_cost,
+        "search_max_depth" => search_max_depth,
+        "search_max_size"  => search_max_size,
+        "timestamp_utc"    => Dates.format(now(UTC), dateformat"yyyy-mm-ddTHH:MM:SS\\Z")
     )
     write_json(summary_path, summary)
 
-    println("\nWrote per-problem stats to: $(per_problem)")
+    println("\nWrote per-problem stats to: $(per_problem_path)")
     println("Wrote summary to           : $(summary_path)")
 end
-
 
 # =================== Entry ===================
 if abspath(PROGRAM_FILE) == @__FILE__

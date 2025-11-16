@@ -1,5 +1,5 @@
 module Grammar
-export construct_dict, make_pcsg_from_dict, grammar_robots, print_pcsg_rules, frequencies_to_costs
+export construct_dict, make_pcsg_from_dict, grammar_robots, print_pcsg_rules, frequencies_to_costs_depth, frequencies_to_costs_flat, apply_flat_costs
 
 using HerbGrammar
 using Printf
@@ -115,43 +115,79 @@ function group_rule_columns_by_lhs(rules::Vector{String})
     return groups
 end
 
-"""
-    frequencies_to_costs(M, rules; alpha=1.0, eps=1e-3) -> C
 
-Convert a depth × rule frequency matrix `M` into a depth × rule **cost** matrix `C`,
-using per-LHS Laplace smoothing (same idea as `make_pcsg_from_dict`):
-
-    weights = counts + alpha
-    probs   = weights / sum(weights)   # per LHS, per depth
-    cost    = max(-log2(probs), eps)
-
-If a whole LHS group has zeros at some depth, Laplace smoothing yields a uniform
-distribution over that group.
-"""
-function frequencies_to_costs(M::AbstractMatrix{<:Real},
-                              rules::Vector{String};
-                              alpha::Float64 = 1.0,
-                              eps::Float64   = 1e-3)
+function frequencies_to_costs_depth(
+    M::AbstractMatrix{<:Real},
+    rules::Vector{String};
+    alpha::Float64 = 0.01,
+    eps::Float64   = 1e-3
+)
     nrows, ncols = size(M)
-    length(rules) == ncols || error("rules length ($length(rules)) ≠ number of columns ($ncols)")
+    length(rules) == ncols || error("rules length ($(length(rules))) ≠ number of columns ($ncols)")
 
-    groups = group_rule_columns_by_lhs(rules)
     C = Array{Float64}(undef, nrows, ncols)
 
     @inbounds for i in 1:nrows
-        # process each LHS independently at this depth
-        for (lhs, idxs) in groups
-            counts  = M[i, idxs]
-            weights = counts .+ alpha
-            total   = sum(weights)
-            total > 0 || error("Unexpected zero total after smoothing for LHS '$lhs' at depth $i")
-            probs   = weights ./ total
-            # costs like in make_pcsg_from_dict: -log2(prob), floored by eps
-            C[i, idxs] = max.(-log2.(probs), eps)
-        end
+        counts  = M[i, :]              # 1 × R row: depth i
+        weights = counts .+ alpha      # Laplace smoothing (optional)
+        total   = sum(weights)
+        total > 0 || error("Unexpected zero total after smoothing at depth $i")
+
+        probs = weights ./ total 
+        C[i, :] = max.(-log2.(probs), eps)
     end
+
     return C
 end
 
+
+function frequencies_to_costs_flat(
+    M::AbstractMatrix{<:Real},
+    rules::Vector{String};
+    alpha::Float64 = 0.01,
+    eps::Float64   = 1e-3
+)::Vector{Float64}
+    nrows, ncols = size(M)
+    length(rules) == ncols || error("rules length ($(length(rules))) ≠ number of columns ($ncols)")
+
+    # total counts per rule across all depths / samples
+    total_per_rule = vec(sum(M; dims=1))  # 1×R -> R
+
+    weights = total_per_rule .+ alpha
+    total   = sum(weights)
+    total > 0 || error("Unexpected zero total after smoothing")
+
+    probs = weights ./ total             # normalizeOkay alright over all rules
+    return max.(-log2.(probs), eps)
+end
+
+# Apply per-rule costs to a Herb grammar (set log_probabilities).
+function apply_flat_costs(grammar::ContextSensitiveGrammar,
+                          rules::Vector{String},
+                          costs::Vector{Float64};
+                          default_cost::Float64 = 10.0)
+    length(rules) == length(costs) || error("rules and costs must have same length")
+    lookup = Dict{String,Float64}()
+    for (j, rulekey) in pairs(rules)
+        lookup[rulekey] = costs[j]
+    end
+
+    logp = fill(default_cost, length(grammar.rules))
+    for (lhs, idxs) in grammar.bytype
+        lhs_str = String(lhs)
+        for i in idxs
+            key = string(lhs_str, "->", canonical_rule_string(grammar.rules[i]))
+            if haskey(lookup, key)
+                logp[i] = lookup[key]
+            end
+        end
+    end
+
+    return ContextSensitiveGrammar(
+        grammar.rules, grammar.types, grammar.isterminal, grammar.iseval,
+        grammar.bytype, grammar.domains, grammar.childtypes, grammar.bychildtypes,
+        logp, grammar.constraints
+    )
+end
 
 end # module

@@ -16,7 +16,7 @@ MODEL = "deepseek-chat"
 BASE_URL = "https://api.deepseek.com"
 API_KEY = os.environ.get("OPENAI_API_KEY")
 
-N_SAMPLES = int(os.environ.get("N_SAMPLES", "1"))  # how many answers per prompt
+N_SAMPLES = int(os.environ.get("N_SAMPLES", "10"))  # how many answers per prompt
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = Path(os.environ.get("PROMPTS_DIR", str(SCRIPT_DIR / "prompts"))).expanduser().resolve()
 ANSWERS_DIR = Path(os.environ.get("ANSWERS_DIR", str(SCRIPT_DIR / "answers"))).expanduser().resolve()

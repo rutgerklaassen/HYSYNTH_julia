@@ -28,6 +28,56 @@ InitialiseResetVariables() = ResetVariables(
     Set{UInt64}(),
     0
 )
+# 4×Action Block shape:
+# Block = (Action; Block(Action; Block(Action; Block(Action))))
+
+const FOUR_ACTION_BLOCK = let
+    # Masks (length 25, matching your grammar order)
+    mask_block_seq = Bool[
+        0, 0, 1, 0,    # 1–4  (rule 3 on)
+        0, 0, 0, 0, 0, # 5–9
+        0, 0, 0, 0,    # 10–13
+        0, 0, 0, 0, 0, # 14–18
+        0, 0, 0, 0, 0, 0, 0 # 19–25
+    ]
+
+    mask_action_any = Bool[
+        0, 0, 0, 0,    # 1–4
+        1, 1, 1, 1, 1, # 5–9  (all primitive actions allowed)
+        0, 0, 0, 0,    # 10–13
+        0, 0, 0, 0, 0, # 14–18
+        0, 0, 0, 0, 0, 0, 0 # 19–25
+    ]
+
+    mask_block_action = Bool[
+        0, 1, 0, 0,    # 1–4  (rule 2 on: Block = Action)
+        0, 0, 0, 0, 0, # 5–9
+        0, 0, 0, 0,    # 10–13
+        0, 0, 0, 0, 0, # 14–18
+        0, 0, 0, 0, 0, 0, 0 # 19–25
+    ]
+
+    # Leaf actions (A1..A4)
+    a1 = UniformHole(mask_action_any, UniformHole[])
+    a2 = UniformHole(mask_action_any, UniformHole[])
+    a3 = UniformHole(mask_action_any, UniformHole[])
+    a4 = UniformHole(mask_action_any, UniformHole[])
+
+    # Innermost Block = Action(A4)
+    b4 = UniformHole(mask_block_action, UniformHole[a4])
+
+    # Block = (A3; b4)
+    b3 = UniformHole(mask_block_seq, UniformHole[a3, b4])
+
+    # Block = (A2; b3)
+    b2 = UniformHole(mask_block_seq, UniformHole[a2, b3])
+
+    # Root Block = (A1; b2)
+    b1 = UniformHole(mask_block_seq, UniformHole[a1, b2])
+
+    b1
+end
+
 
 # ---------- iterator definition (add JIT fields & toggle) ----------
 @programiterator DepthCostBasedBottomUpIterator(
@@ -42,14 +92,15 @@ InitialiseResetVariables() = ResetVariables(
 ) <: AbstractCostBasedBottomUpIterator
 
 get_reset_variables(iter::DepthCostBasedBottomUpIterator) = iter.reset_variables
-
+ 
 # BOUNDED MAX-HEAP OF BEST PARENTS BY DEPTH-AWARE LB
 struct ParentCand
     lb::Float64
     hole::UniformHole
     fp::UInt64
 end
-Base.isless(a::ParentCand, b::ParentCand) = a.lb > b.lb
+
+Base.isless(a::ParentCand, b::ParentCand) = a.lb < b.lb
 
 function build_depth_aware_axes(
     iter::DepthCostBasedBottomUpIterator,
@@ -279,21 +330,9 @@ function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
     depth_limit = get_max_depth(iter)
     enqueued_this_call = Set{UInt64}()  # prevents duplicate heap inserts this pass
 
-    ######DEBUGGING######
-    println("UH INDEX : ", length(bank.uh_index))
-    count_uh_programs(bank) = begin
-        total = 0
-        for ent in values(bank.uh_index)
-            total += isempty(ent.axes) ? 0 : prod(length(ax.options) for ax in ent.axes)
-        end
-        println("Total programs in UH-index: ", total); total
-    end
-    count_uh_programs(bank)
-    ######################
-
     
     # tune or promote to a field later
-    top_n = 1
+    top_n = 10
 
     newly_flagged_ids = Set{Int}()
     for (id, ent) in bank.uh_index
@@ -353,6 +392,7 @@ function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
             end
 
             lb = _lb_uniformhole(iter, grammar, parent_hole)  # depth-aware from logp_by_depth
+
             push!(heap, ParentCand(lb, parent_hole, finger))
             push!(enqueued_this_call, finger)  # local mark only
             if length(heap) > top_n
@@ -360,14 +400,15 @@ function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
             end
         end
     end
-
     # clear flags
     for id in newly_flagged_ids
         bank.uh_index[id].new_shape = false
     end
-
+    
+    
     # materialize only the kept parents
     added_ids = Int[]
+    i = 0
     while !isempty(heap)
         cand = pop!(heap)
         if cand.fp ∈ reset_variables.seen_shapes
@@ -399,8 +440,47 @@ function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
             end
         end
     end
-    println("\n SEEEN AMOUNT : ", reset_variables.seen_amount)
-    println("OUT SIZE : ", length(out))
+
+    ######DEBUGGING######
+    # println("UH INDEX : ", length(bank.uh_index))
+
+    # count_uh_programs(bank) = begin
+    #     total = 0
+    #     for ent in values(bank.uh_index)
+    #         total += isempty(ent.axes) ? 0 : prod(length(ax.options) for ax in ent.axes)
+    #     end
+    #     println("Total programs in UH-index: ", total)
+    #     total
+    # end
+    # count_uh_programs(bank)
+
+    # grammar = get_grammar(iter.solver)
+
+    # println("Current bank entries (shapes + LBs):")
+    # for (id, ent) in bank.uh_index
+    #     hole = ent.hole
+    #     lb   = _lb_uniformhole(iter, grammar, hole)
+    #     depth = tree_depth(hole)
+    #     size  = program_rule_count(hole)
+
+    #     println("  id = $id")
+    #     println("    rtype = $(ent.rtype)")
+    #     println("    depth = $depth, size = $size, lb = $lb")
+    #     println("    hole  = ", hole)  # or a custom pretty-printer if you have one
+    #     # test = UniformHole{2}
+    #     println(typeof(hole))
+    #     println(typeof(FOUR_ACTION_BLOCK))
+    #     # println(FOUR_ACTION_BLOCK)
+    #     println("test")
+    #     println(string(hole))
+    #     if string(hole) == "UniformHole[Bool[0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]{UniformHole[Bool[0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],UniformHole[Bool[0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]{UniformHole[Bool[0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],UniformHole[Bool[0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]{UniformHole[Bool[0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],UniformHole[Bool[0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]{UniformHole[Bool[0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]}}}}"            
+    #         println("JAAAAAAAAA")
+    #         exit()
+    #     end
+    # end
+
+    ######################
+
     sort!(out; by = a -> a.cost)
     return out, state
 end

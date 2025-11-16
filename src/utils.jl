@@ -78,7 +78,15 @@ function make_rule_matrix(grammar; nrows::Int = 6)
     return M, rules, rule_index
 end
 
-
+normalize_rule_str(s::AbstractString) = begin
+    s = replace(s, r"\s+" => " ") |> strip
+    s = replace(s, "(Action ; Block)" => "(Action; Block)")
+    s = replace(s, "REPEAT(R=INT, Block)" => "REPEAT(R = INT, Block)")
+    s = replace(s, "ControlFlow->WHILE(Condition, Block)"      => "ControlFlow->WHILE(ConditionFlow, Block)")
+    s = replace(s, "ControlFlow->IF(Condition, Block)"         => "ControlFlow->IF(ConditionFlow, Block)")
+    s = replace(s, "ControlFlow->IFELSE(Condition, Block, Block)" => "ControlFlow->IFELSE(ConditionFlow, Block, Block)")
+    s
+end
 """
     counts_matrix(counts_by_depth, grammar; nrows=6) -> (M, rules)
 
@@ -91,7 +99,8 @@ function counts_matrix(counts_by_depth::Dict{Int, Dict{String, Int}}, grammar; n
     for (depth, d) in counts_by_depth
         1 <= depth <= nrows || continue
         for (rule_str, cnt) in d
-            j = get(rule_index, rule_str, 0)
+            rs = normalize_rule_str(rule_str)
+            j = get(rule_index, rs, 0)
             j == 0 && continue           # skip rules not in the grammar
             M[depth, j] += cnt
         end
