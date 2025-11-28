@@ -233,6 +233,11 @@ function run_depth_iter_for_problem(ds, pid::Int, G::AbstractGrammar, C::Matrix{
     best_prog = nothing
     solved = false
     reset_variables = Depth_synthesis.get_reset_variables(it)
+    if reset_variables !== nothing && jit_enabled
+        reset_variables.programs_since_reset = 0
+        reset_variables.improved_since_reset = false
+    end
+
     st = nothing
     nxt = iterate(it)
     steps = 0
@@ -249,7 +254,10 @@ function run_depth_iter_for_problem(ds, pid::Int, G::AbstractGrammar, C::Matrix{
         if steps % 1000 == 0
             println(steps)
         end
-
+        if steps >= 100000
+            println("Global step limit reached (100000); stopping search on this problem.")
+            break
+        end
         expr = rulenode2expr(fpnode, G)
         fp   = prog_fingerprint(expr)
         if fp ∈ seen
@@ -258,6 +266,25 @@ function run_depth_iter_for_problem(ds, pid::Int, G::AbstractGrammar, C::Matrix{
         else
             push!(seen, fp)
         end
+
+        if reset_variables !== nothing && jit_enabled
+            reset_variables.programs_since_reset += 1
+
+            if reset_variables.programs_since_reset >= 20_000
+                if reset_variables.improved_since_reset
+                    # Case 1: budget reached AND we improved → PROBE-style reset
+                    println("Budget reached with improvement; triggering reset")
+                    reset_variables.depth_exhausted = true
+                    reset_variables.programs_since_reset = 0
+                    reset_variables.improved_since_reset = false
+                else
+                    # Case 2: budget reached and no improvement → stop search on this problem
+                    println("Budget reached with no improvement; stopping search")
+                    break
+                end
+            end
+        end
+
 
         hits, total, extra = KarelUtils.count_matches(fpnode, prob, G)
         strict_ok = KarelUtils.satisfies_problem_strict(fpnode, prob, G)
@@ -291,15 +318,18 @@ function run_depth_iter_for_problem(ds, pid::Int, G::AbstractGrammar, C::Matrix{
                     " is a new best hit! ", best_hits , " / ", total,
                     " extra=", extra, " size=", sz, " depth=", Depth_synthesis.tree_depth(p))
             if depth_aware_enabled
-
                 d0 = ProbeUpdate.default_depth0(HerbSearch.get_grammar(it.solver), p)
                 new_costs = ProbeUpdate.update_depth!(probe_state, HerbSearch.get_grammar(it.solver), p, hits, total; depth0=d0)
                 it.logp_by_depth .= new_costs
             else
-                new_costs = ProbeUpdate.update_flat!(flat_probe_state, HerbSearch.get_grammar(it.solver), p, hits, total)               
-                it.logp_by_depth[:, 1] .= new_costs 
+                new_costs = ProbeUpdate.update_flat!(flat_probe_state, HerbSearch.get_grammar(it.solver), p, hits, total)
+                it.logp_by_depth[:, 1] .= new_costs
             end
-            reset_variables !== nothing && (reset_variables.depth_exhausted = true)
+
+            if reset_variables !== nothing
+                reset_variables.improved_since_reset = true
+                # DO NOT set depth_exhausted here anymore
+            end
         end
 
         nxt = iterate(it, st)
@@ -311,13 +341,14 @@ end
 # =================== Experiment folder naming ===================
 function build_experiment_dir(manifest_base::AbstractString;
     llm_enabled::Bool, traces_enabled::Bool, updating_enabled::Bool, depth_aware_enabled::Bool,
-    model_filter::String, nrows::Int, max_depth::Int)
+    model_filter::String, nrows::Int, max_depth::Int, kernel_smoothing_enabled::Bool)
 
     parts = String[
         llm_enabled      ? "llm"      : "nollm",
         traces_enabled   ? "traces"   : "notraces",
         updating_enabled ? "probe"    : "noprobe",
         depth_aware_enabled ? "depth" : "nodepth",
+        kernel_smoothing_enabled ? "smoothed" : "",
         isempty(model_filter) ? "model-any" : "model-" * replace(model_filter, r"[^A-Za-z0-9_.-]" => "_"),
         "nrows-$(nrows)",
         "md-$(max_depth)",
@@ -344,7 +375,7 @@ function main()
     updating_enabled = get(cfg, "--updating_enabled", "false") == "true"
     traces_enabled   = get(cfg, "--traces_enabled", "false") == "true"
     depth_aware_enabled = get(cfg, "--depth_aware_enabled", "false") == "true"
-    kernel_smoothing_enabled = get(cfg, "--kernel_smoothing_enabled", "false") == "true"
+    kernel_smoothing_enabled = get(cfg, "--smoothing-enabled", "false") == "true"
     oracle = get(cfg, "--oracle_enabled", "false") == "true"
 
     # Search knobs (lift to CLI later if desired)
@@ -367,7 +398,7 @@ function main()
     # Experiment directory
     exp_dir = build_experiment_dir(manifest_base;
         llm_enabled=llm_enabled, traces_enabled=traces_enabled, updating_enabled=updating_enabled, depth_aware_enabled=depth_aware_enabled,
-        model_filter=model_filter, nrows=nrows, max_depth=search_max_depth)
+        model_filter=model_filter, nrows=nrows, max_depth=search_max_depth, kernel_smoothing_enabled=kernel_smoothing_enabled)
 
     per_problem_path = joinpath(exp_dir, "per_problem.json")
     summary_path     = joinpath(exp_dir, "summary.json")
@@ -482,8 +513,8 @@ function main()
 
         # Accumulate and convert to costs
         M_sum, rules, nvalid = accumulate_counts_matrix(trees; G=G, nrows=nrows)
-
         if kernel_smoothing_enabled
+            println("smoothing frequencies...")
             M_sum = kernel_smoothing(M_sum, rules) #transpose it so it works with the function 
         end
         #println(size(M_sum))
@@ -522,14 +553,10 @@ function main()
         println("  counts-matrix size: ", size(M_sum), " -> cost size: ", size(CDepth))
 
         if depth_aware_enabled
-            # existing depth-aware iterator call (unchanged)
-            # println(CDepth)
-            for i in 1:size(CDepth, 1)
-                rule = rules[i]
-                row = CDepth[i, :]
-                println(@sprintf("%2d: %-40s  %s", i, rule, row,))
-            end
+            # existing depth-aware iterator call 
             depth_state = ProbeUpdate.DepthProbeState(CDepth)  # baseline = the costs you just computed
+            println(CDepth)
+            # exit(0)
             res = run_depth_iter_for_problem(ds, pid, G, CDepth;
                 max_cost=search_max_cost, max_depth=search_max_depth,
                 max_size=search_max_size, jit_enabled=updating_enabled,
@@ -537,17 +564,17 @@ function main()
         else
             # --- flat costs from LLM frequencies ---
             Cflat = Grammar.frequencies_to_costs_flat(M_sum, rules)  # Vector{Float64} (R)
-            println(Cflat)
             if !llm_enabled
                 Cflat .= 1.0
             end
-            println(Cflat)
             # 1-column adapter → depth-agnostic costs
             C1 = reshape(Cflat, :, 1)                                # (R × 1)
             flat_state = ProbeUpdate.FlatProbeState(Cflat)
+            println(C1)
+            # exit(0)
             # Pass C1 (not CDepth) to the iterator driver:
             res = run_depth_iter_for_problem(
-                ds, pid, G, C1;                 # <-- this is the key change
+                ds, pid, G, C1;                 
                 max_cost=search_max_cost, max_depth=search_max_depth,
                 max_size=search_max_size,
                 jit_enabled=updating_enabled,

@@ -10,8 +10,8 @@ import HerbCore: UniformHole, AbstractUniformHole, Hole
 import HerbSearch: AbstractCostBasedBottomUpIterator, CostBank, CostAccessAddress, indices_at_cost, _pathvec
 
 export DepthCostBasedBottomUpIterator,
-       apply_probe_update!,           # <- new: single call from your outer loop
-       program_rule_count             # <- handy metric for “smaller is better” tie-break
+       apply_probe_update!,           
+       program_rule_count            
 
 mutable struct ResetVariables
     depth_exhausted::Bool
@@ -19,6 +19,8 @@ mutable struct ResetVariables
     max_resets::Int
     seen_shapes::Set{UInt64}
     seen_amount::Int
+    programs_since_reset::Int     
+    improved_since_reset::Bool    
 end
 
 InitialiseResetVariables() = ResetVariables(
@@ -26,7 +28,9 @@ InitialiseResetVariables() = ResetVariables(
     0,        # reset_count
     100,
     Set{UInt64}(),
-    0
+    0,
+    0,                 # programs_since_reset
+    false              # improved_since_reset
 )
 # 4×Action Block shape:
 # Block = (Action; Block(Action; Block(Action; Block(Action))))
@@ -155,11 +159,27 @@ function build_depth_aware_axes(
     return axes
 end
 
+# function HerbSearch.add_to_bank!(iter::DepthCostBasedBottomUpIterator, uh::UniformHole)::Int
+#     grammar = get_grammar(iter.solver)
+#     bank    = get_bank(iter)
+#     axes = build_depth_aware_axes(iter, grammar, uh)
+#     T    = build_cost_tensor(axes)
+#     sorted_costs = unique_sorted_costs(T)
+#     rtype = HerbGrammar.return_type(grammar, uh)
+#     uh_id = (bank.next_id[] += 1) - 1
+#     usolver = UniformSolver(grammar, uh, with_statistics=get_solver(iter).statistics)
+#     uiter   = UniformIterator(usolver, iter)
+#     bank.uh_index[uh_id] = UniformTreeEntry(uh, axes, T, sorted_costs, rtype, true, uiter)
+#     return uh_id
+# end
 
 function HerbSearch.add_to_bank!(iter::DepthCostBasedBottomUpIterator, uh::UniformHole)::Int
     grammar = get_grammar(iter.solver)
     bank    = get_bank(iter)
-    axes = build_depth_aware_axes(iter, grammar, uh)
+
+    depth0 = _root_depth_for(uh, grammar)
+    axes   = build_depth_aware_axes(iter, grammar, uh; depth=depth0)
+
     T    = build_cost_tensor(axes)
     sorted_costs = unique_sorted_costs(T)
     rtype = HerbGrammar.return_type(grammar, uh)
@@ -169,6 +189,7 @@ function HerbSearch.add_to_bank!(iter::DepthCostBasedBottomUpIterator, uh::Unifo
     bank.uh_index[uh_id] = UniformTreeEntry(uh, axes, T, sorted_costs, rtype, true, uiter)
     return uh_id
 end
+
 
 # ---------- helper: rule index + children (UniformHole / StateHole) ----------
 _ruleindex(u::UniformHole) = begin
@@ -267,7 +288,20 @@ function _min_domain_cost_at_depth(iter::DepthCostBasedBottomUpIterator,
     idxs = findall(domain)
     @inbounds return minimum(iter.logp_by_depth[i, dclamp] for i in idxs)
 end
+# Starting depth for a hole, matching your apply_probe_update! convention.
+function _root_depth_for(hole::UniformHole, grammar::AbstractGrammar)::Int
+    rt = HerbGrammar.return_type(grammar, hole)
 
+    depth0 = 1
+    if rt === :Block
+        # same as in apply_probe_update!: depth + 1 for Block
+        depth0 = 2
+    elseif rt === :Action || rt === :ControlFlow
+        # depth + 2 there → start subtree at 3
+        depth0 = 3
+    end
+    return depth0
+end
 # Depth-aware lower bound for a UniformHole (operators at depth d, children at d+1)
 function _lb_uniformhole!(iter::DepthCostBasedBottomUpIterator,
                           grammar::AbstractGrammar,
@@ -292,7 +326,57 @@ end
 
 _lb_uniformhole(iter::DepthCostBasedBottomUpIterator,
                 grammar::AbstractGrammar,
-                hole::UniformHole)::Float64 = _lb_uniformhole!(iter, grammar, hole, 1)
+                hole::UniformHole)::Float64 =
+begin
+    # Determine the return type of this hole
+    rt = HerbGrammar.return_type(grammar, hole)
+
+    # Extra synthetic cost for the implicit Start/Block wrappers
+    # extra_cost = 0.0
+    depth0     = 1  # starting depth for the real subtree
+
+    if rt === :Start
+        # Full Start-rooted tree: no lifting
+        depth0 = 1
+        # extra_cost = 0.0
+
+    elseif rt === :Block
+        # Pretend we have: Start -> Block at depth 1
+        # Then this Block subtree starts at depth 2
+        depth0 = 2
+        # extra_cost = _min_domain_cost_at_depth(
+            # iter,
+            # grammar.domains[:Start],  # whatever Start can expand to
+            # 1,
+        # )
+
+    elseif rt === :Action
+        # Pretend:
+        #   depth 1: Start -> ...
+        #   depth 2: Block -> ...
+        # Then Action subtree at depth 3
+        depth0 = 3
+        # extra_cost  = _min_domain_cost_at_depth(iter, grammar.domains[:Start], 1)
+        # extra_cost += _min_domain_cost_at_depth(iter, grammar.domains[:Block], 2)
+
+    elseif rt === :ControlFlow
+        # Same lifting pattern as Action:
+        #   depth 1: Start -> ...
+        #   depth 2: Block -> ...
+        #   depth 3+: ControlFlow subtree
+        depth0 = 3
+        # extra_cost  = _min_domain_cost_at_depth(iter, grammar.domains[:Start], 1)
+        # extra_cost += _min_domain_cost_at_depth(iter, grammar.domains[:Block], 2)
+
+    else
+        # For INT / Condition / ConditionFlow etc. we don't currently lift;
+        # you can tighten this later if needed.
+        depth0 = 1
+        # extra_cost = 0.0
+    end
+
+    return _lb_uniformhole!(iter, grammar, hole, depth0)
+end
 
 @inline function _mix(h::UInt64, x::UInt64)
     h ⊻= x
@@ -450,7 +534,6 @@ function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
     #         total += isempty(ent.axes) ? 0 : prod(length(ax.options) for ax in ent.axes)
     #     end
     #     println("Total programs in UH-index: ", total)
-    #     total
     # end
     # count_uh_programs(bank)
 
@@ -463,25 +546,28 @@ function HerbSearch.combine(iter::DepthCostBasedBottomUpIterator, state)
     #     depth = tree_depth(hole)
     #     size  = program_rule_count(hole)
 
-    #     println("  id = $id")
-    #     println("    rtype = $(ent.rtype)")
-    #     println("    depth = $depth, size = $size, lb = $lb")
-    #     println("    hole  = ", hole)  # or a custom pretty-printer if you have one
+    #     # println("  id = $id")
+    #     # println("    rtype = $(ent.rtype)")
+    #     # println("    depth = $depth, size = $size, lb = $lb")
+    #     # println("    hole  = ", hole)  # or a custom pretty-printer if you have one
     #     # test = UniformHole{2}
-    #     println(typeof(hole))
-    #     println(typeof(FOUR_ACTION_BLOCK))
     #     # println(FOUR_ACTION_BLOCK)
-    #     println("test")
-    #     println(string(hole))
+    #     # println(string(hole))
     #     if string(hole) == "UniformHole[Bool[0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]{UniformHole[Bool[0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],UniformHole[Bool[0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]{UniformHole[Bool[0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],UniformHole[Bool[0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]{UniformHole[Bool[0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],UniformHole[Bool[0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]{UniformHole[Bool[0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]}}}}"            
     #         println("JAAAAAAAAA")
-    #         exit()
+    #         println(lb)
+    #         # exit()
     #     end
     # end
 
     ######################
 
     sort!(out; by = a -> a.cost)
+    # println(typeof(out))
+    # for a in out
+    #     println(a.cost)
+    # end
+
     return out, state
 end
 
@@ -612,6 +698,8 @@ function Base.iterate(iter::DepthCostBasedBottomUpIterator, state::GenericBUStat
     if reset_variables.depth_exhausted && (reset_variables.reset_count < reset_variables.max_resets)
         reset_variables.reset_count += 1
         reset_variables.depth_exhausted = false  # consume the f
+        reset_variables.programs_since_reset = 0
+        reset_variables.improved_since_reset = false
         _reset_bank_and_seed!(iter)
         return Base.iterate(iter)
     end
