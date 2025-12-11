@@ -117,12 +117,29 @@ def main():
 
             for k in range(start_idx, start_idx + N_SAMPLES):
                 out_file = out_parent / f"{stem}_answer_{k:04d}.txt"
+                system_text = """
+                    You are a coding assistant. Be precise and terse.
 
+                    You will be given:
+                    - A DSL as a context-free grammar (CFG).
+                    - The operational semantics of a string-editing machine.
+                    - A set of input→output examples.
+
+                    Your task is to output ONE program in the DSL that:
+                    - Is syntactically valid w.r.t. the provided CFG.
+                    - When executed under the semantics, transforms every input into the required output.
+                    - Terminates on all examples.
+                    - Is as short/simple as possible.
+
+                    OUTPUT FORMAT (STRICT):
+                    - output ONLY the program.
+                    - No explanations, no comments, no prose.
+                    """
                 # Call model
                 resp = client.chat.completions.create(
                     model=MODEL,
                     messages=[
-                        {"role": "system", "content": ""},
+                        {"role": "system", "content": system_text},
                         {"role": "user", "content": prompt_text},
                     ],
                     stream=False,

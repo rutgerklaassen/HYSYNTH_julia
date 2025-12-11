@@ -1,7 +1,14 @@
 module Utils
 export read_response, print_tree, collect_counts_by_depth, counts_matrix, pretty_print_counts, make_rule_matrix
-import ..ParseKarel: ParseTree
 using HerbGrammar
+
+# ---------- Tree ----------
+mutable struct ParseTree
+    rule::String
+    children::Vector{ParseTree}
+end
+
+
 function read_response(path::String)::String
     isfile(path) || error("Response file not found: $path")
     return read(path, String)
@@ -15,7 +22,7 @@ Print the tree and simultaneously accumulate:
   - per-depth counts in `counts_by_depth`
 Returns `(rule_counts, counts_by_depth)`.
 """
-function print_tree(tree::ParseTree;
+function print_tree(tree;
                     rule_counts=Dict{String, Int}(),
                     counts_by_depth=Dict{Int, Dict{String, Int}}(),
                     prefix::String="",
